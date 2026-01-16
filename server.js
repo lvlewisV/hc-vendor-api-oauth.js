@@ -1,5 +1,5 @@
 /**
- * HalfCourse Vendor API v2 – OAuth (Stabilized)
+ * HalfCourse Vendor API v2 – OAuth (Stabilized + Vendor-Safe)
  */
 
 require('dotenv').config();
@@ -17,6 +17,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE?.trim(); // optional fallback: 0ugisc-62.myshopify.com
 const SHOPIFY_SCOPES =
   process.env.SHOPIFY_SCOPES ||
   'read_products,write_products,read_metafields,write_metafields,read_collections';
@@ -50,6 +51,18 @@ const VENDOR_MAP = {
 function getVendorName(handle) {
   return VENDOR_MAP[handle] || handle;
 }
+
+// ================= VENDOR AUTH =================
+
+// Simple vendor credential store (replace later if needed)
+const VENDOR_CREDENTIALS = {
+  liandros: {
+    password: process.env.VENDOR_LIANDROS_PASSWORD || 'halfcourse2024',
+  },
+};
+
+// In-memory vendor sessions
+const vendorSessions = {};
 
 // ================= HELPERS =================
 
@@ -87,8 +100,9 @@ function getBaseUrl(shop) {
 
 // Start OAuth
 app.get('/auth', (req, res) => {
-  // ⚠️ OAuth must target the shop being installed
-  const shop = req.query.shop;
+  // For real installs Shopify will pass ?shop=...
+  // For manual testing you can omit it if SHOPIFY_STORE is set.
+  const shop = req.query.shop || SHOPIFY_STORE;
 
   if (!shop) {
     return res.status(400).send('Missing shop parameter');
@@ -101,7 +115,7 @@ app.get('/auth', (req, res) => {
   const authUrl =
     `https://${normalizedShop}/admin/oauth/authorize` +
     `?client_id=${SHOPIFY_CLIENT_ID}` +
-    `&scope=${SHOPIFY_SCOPES}` +
+    `&scope=${encodeURIComponent(SHOPIFY_SCOPES)}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&state=${state}`;
 
@@ -160,6 +174,35 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
+// ================= VENDOR LOGIN =================
+
+app.post('/api/vendor/login', (req, res) => {
+  const { handle, password } = req.body;
+
+  if (!handle || !password) {
+    return res.status(400).json({ error: 'Missing credentials' });
+  }
+
+  const vendor = VENDOR_CREDENTIALS[handle];
+
+  if (!vendor || vendor.password !== password) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  // Create simple session token
+  const token = crypto.randomBytes(24).toString('hex');
+
+  vendorSessions[token] = {
+    handle,
+    createdAt: Date.now(),
+  };
+
+  res.json({
+    token,
+    handle,
+  });
+});
+
 // ================= AUTH MIDDLEWARE =================
 
 function requireAuth(req, res, next) {
@@ -168,13 +211,33 @@ function requireAuth(req, res, next) {
 
   if (!shop || !token) {
     return res.status(401).json({
-      error: 'Not authenticated',
-      authUrl: `${APP_URL}/auth`,
+      error: 'Not authenticated (Shopify not connected)',
+      authUrl: `${APP_URL}/auth${SHOPIFY_STORE ? '' : '?shop=YOURSHOP.myshopify.com'}`,
     });
   }
 
   req.shop = shop;
   req.accessToken = token;
+  next();
+}
+
+// ================= VENDOR AUTH MIDDLEWARE =================
+
+function requireVendor(req, res, next) {
+  const auth = req.headers.authorization;
+
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing vendor token' });
+  }
+
+  const token = auth.replace('Bearer ', '');
+  const session = vendorSessions[token];
+
+  if (!session) {
+    return res.status(401).json({ error: 'Invalid vendor token' });
+  }
+
+  req.vendorHandle = session.handle;
   next();
 }
 
@@ -188,19 +251,28 @@ app.get('/health', (req, res) => {
     status: 'ok',
     authenticated: connectedShops.length > 0,
     connectedShops,
+    vendorSessions: Object.keys(vendorSessions).length, // just a count
     timestamp: new Date().toISOString(),
   });
 });
 
-// Vendor products
-app.get('/api/vendors/:handle/products', requireAuth, async (req, res) => {
-  const vendorName = getVendorName(req.params.handle);
+// ✅ Vendor products (LOCKED to logged-in vendor)
+app.get(
+  '/api/vendors/:handle/products',
+  requireVendor,
+  async (req, res) => {
+  const requestedHandle = req.params.handle;
+
+  // Prevent a vendor from accessing another vendor's products
+  if (requestedHandle !== req.vendorHandle) {
+    return res.status(403).json({ error: 'Forbidden: vendor mismatch' });
+  }
+
+  const vendorName = getVendorName(req.vendorHandle);
 
   try {
     const response = await fetch(
-      `${getBaseUrl(req.shop)}/products.json?vendor=${encodeURIComponent(
-        vendorName
-      )}&limit=250`,
+      `${getBaseUrl(req.shop)}/products.json?vendor=${encodeURIComponent(vendorName)}&limit=250`,
       { headers: getShopifyHeaders(req.shop) }
     );
 
@@ -226,7 +298,7 @@ app.get('/', (req, res) => {
           connected
             ? '<p style="color:green;">✅ Connected to Shopify</p>'
             : `<p style="color:orange;">⚠️ Not connected</p>
-               <p>Install the app via the Shopify Partner Dashboard</p>`
+               <p>Install the app via the Shopify Partner Dashboard (or visit /auth?shop=YOURSHOP.myshopify.com)</p>`
         }
       </body>
     </html>
