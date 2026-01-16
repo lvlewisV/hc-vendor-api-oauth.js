@@ -182,10 +182,12 @@ function requireAuth(req, res, next) {
 
 // Health / debug
 app.get('/health', (req, res) => {
+  const connectedShops = Object.keys(accessTokens);
+
   res.json({
     status: 'ok',
-    authenticated: !!getAccessToken(),
-    connectedShops: Object.keys(accessTokens),
+    authenticated: connectedShops.length > 0,
+    connectedShops,
     timestamp: new Date().toISOString(),
   });
 });
