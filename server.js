@@ -31,11 +31,23 @@ const JWT_SECRET = process.env.JWT_SECRET || 'halfcourse-secret-key-change-in-pr
 let shopifyAccessTokens = {};
 let vendorSessions = {}; // Store vendor session tokens
 
-// Middleware
+// Middleware - CORS Configuration
 app.use(cors({
-  origin: true, // Allow all origins for now
+  origin: [
+    'https://halfcourse.com',
+    'https://www.halfcourse.com',
+    'https://half-course.myshopify.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 }));
+
+// Handle preflight requests explicitly
+app.options('*', cors());
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
