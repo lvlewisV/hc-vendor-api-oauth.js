@@ -1,38 +1,96 @@
 /**
- * HalfCourse Vendor API v3 - Fixed Version
+ * HalfCourse Vendor Product Editor API
  * 
- * Fixes:
- * - Proper middleware chain (requireAuth before requireVendor)
- * - Vendor login with environment-based passwords
- * - JWT tokens for vendor sessions
+ * A Node.js/Express backend that allows vendors to manage their products
+ * without needing Shopify admin access.
+ * 
+ * Features:
+ * - Shopify OAuth authentication
+ * - Token persistence (survives server restarts)
+ * - Vendor login with password protection
+ * - Product CRUD operations (filtered by vendor)
+ * - Image upload/delete
+ * - Metafields support
+ * 
+ * Deploy to: Render.com
+ * Repository: github.com/lvlewisV/hc-vendor-api-oauth.js
  */
-
-require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const multer = require('multer');
-const crypto = require('crypto');
 const fetch = require('node-fetch');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
 
-// Config
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+const PORT = process.env.PORT || 3000;
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE || 'half-course';
 const SHOPIFY_SCOPES = process.env.SHOPIFY_SCOPES || 'read_products,write_products,read_orders';
-const APP_URL = process.env.APP_URL || 'http://localhost:3000';
-const API_VERSION = '2024-01';
-const JWT_SECRET = process.env.JWT_SECRET || 'halfcourse-secret-key-change-in-production';
+const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
 
-// Store access tokens in memory (use Redis/DB in production)
+// Vendor handle to Shopify vendor name mapping
+// The key is the URL-friendly handle, the value is the exact vendor name in Shopify
+const VENDOR_MAP = {
+  'liandros': "Liandro's",
+  // Add more vendors here as needed:
+  // 'marias-kitchen': "Maria's Kitchen",
+  // 'bobs-bbq': "Bob's BBQ",
+};
+
+// Token storage file path (for persistence across restarts)
+const TOKEN_FILE = process.env.TOKEN_FILE || '/tmp/shopify_tokens.json';
+
+// =============================================================================
+// TOKEN PERSISTENCE
+// =============================================================================
+
+// In-memory token storage (loaded from file on startup)
 let shopifyAccessTokens = {};
-let vendorSessions = {}; // Store vendor session tokens
 
-// Middleware - CORS Configuration
-app.use(cors({
+// Load tokens from file on startup
+function loadTokens() {
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      const data = fs.readFileSync(TOKEN_FILE, 'utf8');
+      shopifyAccessTokens = JSON.parse(data);
+      console.log('✅ Loaded tokens from file');
+    }
+  } catch (error) {
+    console.log('⚠️ Could not load tokens from file:', error.message);
+    shopifyAccessTokens = {};
+  }
+}
+
+// Save tokens to file
+function saveTokens() {
+  try {
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(shopifyAccessTokens, null, 2));
+    console.log('✅ Saved tokens to file');
+  } catch (error) {
+    console.log('⚠️ Could not save tokens to file:', error.message);
+  }
+}
+
+// Load tokens on startup
+loadTokens();
+
+// Vendor session tokens (in-memory, expire after 24 hours)
+const vendorSessions = {};
+
+// =============================================================================
+// MIDDLEWARE
+// =============================================================================
+
+// CORS configuration - allow requests from Shopify storefront
+const corsOptions = {
   origin: [
     'https://halfcourse.com',
     'https://www.halfcourse.com',
@@ -43,217 +101,108 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
-}));
-
-// Handle preflight requests explicitly
-app.options('*', cors());
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// ===== VENDOR MAP =====
-const VENDOR_MAP = {
-  'liandros': "Liandro's",
-  // Add more vendors here:
-  // 'marias-kitchen': "Maria's Kitchen",
 };
 
-// Vendor passwords from environment variables
-// Format: VENDOR_[HANDLE]_PASSWORD (uppercase, hyphens become underscores)
-function getVendorPassword(handle) {
-  const envKey = `VENDOR_${handle.toUpperCase().replace(/-/g, '_')}_PASSWORD`;
-  return process.env[envKey] || process.env.DEFAULT_VENDOR_PASSWORD || 'halfcourse2024';
-}
+app.use(cors(corsOptions));
 
-function getVendorName(handle) {
-  return VENDOR_MAP[handle] || handle;
-}
+// Handle preflight requests
+app.options('*', cors(corsOptions));
 
-// Generate simple session token
-function generateSessionToken(handle) {
-  const token = crypto.randomBytes(32).toString('hex');
-  vendorSessions[token] = {
-    handle,
-    createdAt: Date.now(),
-    expiresAt: Date.now() + (24 * 60 * 60 * 1000) // 24 hours
-  };
-  return token;
-}
+// Parse JSON bodies
+app.use(express.json({ limit: '10mb' }));
 
-// Validate session token
-function validateSessionToken(token) {
-  const session = vendorSessions[token];
-  if (!session) return null;
-  if (Date.now() > session.expiresAt) {
-    delete vendorSessions[token];
-    return null;
-  }
-  return session;
-}
+// Parse URL-encoded bodies
+app.use(express.urlencoded({ extended: true }));
 
-// ===== OAUTH ROUTES =====
-
-// Step 1: Start OAuth flow
-app.get('/auth', (req, res) => {
-  const shop = `${SHOPIFY_STORE}.myshopify.com`;
-  const state = crypto.randomBytes(16).toString('hex');
-  const redirectUri = `${APP_URL}/auth/callback`;
-  
-  const authUrl = `https://${shop}/admin/oauth/authorize?` +
-    `client_id=${SHOPIFY_CLIENT_ID}` +
-    `&scope=${SHOPIFY_SCOPES}` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&state=${state}`;
-  
-  res.redirect(authUrl);
+// File upload handling (for product images)
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
 
-// Step 2: OAuth callback
-app.get('/auth/callback', async (req, res) => {
-  const { code, shop, state } = req.query;
-  
-  if (!code || !shop) {
-    return res.status(400).send('Missing code or shop');
-  }
-  
-  try {
-    const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: SHOPIFY_CLIENT_ID,
-        client_secret: SHOPIFY_CLIENT_SECRET,
-        code: code
-      })
-    });
-    
-    const data = await response.json();
-    
-    if (data.access_token) {
-      shopifyAccessTokens[shop] = data.access_token;
-      console.log('✅ Access token obtained for:', shop);
-      
-      res.send(`
-        <html>
-          <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-            <h1>✅ Connected!</h1>
-            <p>HalfCourse Vendor API is now connected to your store.</p>
-            <p>You can close this window.</p>
-          </body>
-        </html>
-      `);
-    } else {
-      throw new Error(data.error || 'Failed to get access token');
-    }
-  } catch (error) {
-    console.error('OAuth error:', error);
-    res.status(500).send('Authentication failed: ' + error.message);
-  }
+// Request logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
+  next();
 });
 
-// ===== VENDOR LOGIN =====
-app.post('/api/vendor/login', (req, res) => {
-  const { handle, password } = req.body;
-  
-  if (!handle || !password) {
-    return res.status(400).json({ error: 'Missing handle or password' });
-  }
-  
-  const correctPassword = getVendorPassword(handle);
-  
-  console.log(`Login attempt for vendor: ${handle}`);
-  
-  if (password !== correctPassword) {
-    console.log(`❌ Invalid password for vendor: ${handle}`);
-    return res.status(401).json({ error: 'Invalid password' });
-  }
-  
-  const token = generateSessionToken(handle);
-  console.log(`✅ Login successful for vendor: ${handle}`);
-  
-  res.json({ 
-    success: true, 
-    token,
-    vendor: {
-      handle,
-      name: getVendorName(handle)
-    }
-  });
-});
+// =============================================================================
+// AUTHENTICATION MIDDLEWARE
+// =============================================================================
 
-// ===== HELPER: Get Shopify Access Token =====
-function getShopifyAccessToken() {
-  const shop = `${SHOPIFY_STORE}.myshopify.com`;
-  return shopifyAccessTokens[shop] || process.env.SHOPIFY_ACCESS_TOKEN;
-}
-
-function getShopifyHeaders() {
-  const token = getShopifyAccessToken();
-  if (!token) {
-    throw new Error('No Shopify access token available');
-  }
-  return {
-    'Content-Type': 'application/json',
-    'X-Shopify-Access-Token': token
-  };
-}
-
-function getBaseUrl() {
-  return `https://${SHOPIFY_STORE}.myshopify.com/admin/api/${API_VERSION}`;
-}
-
-// ===== MIDDLEWARE: Require Shopify Auth =====
+/**
+ * Middleware: Require Shopify OAuth connection
+ * Checks if we have a valid access token for the store
+ */
 function requireShopifyAuth(req, res, next) {
-  try {
-    const token = getShopifyAccessToken();
-    if (!token) {
-      return res.status(401).json({ 
-        error: 'Shopify not connected', 
-        authUrl: `${APP_URL}/auth` 
-      });
-    }
-    req.shopifyToken = token;
-    next();
-  } catch (error) {
-    res.status(401).json({ 
-      error: 'Shopify authentication required', 
-      authUrl: `${APP_URL}/auth` 
+  const token = shopifyAccessTokens[SHOPIFY_STORE];
+  if (!token) {
+    return res.status(401).json({ 
+      error: 'Shopify not connected',
+      message: 'Please connect to Shopify first by visiting the /auth endpoint'
     });
   }
+  req.shopifyToken = token;
+  req.shop = SHOPIFY_STORE;
+  next();
 }
 
-// ===== MIDDLEWARE: Require Vendor Auth =====
+/**
+ * Middleware: Require vendor authentication
+ * Validates the vendor session token from Authorization header
+ */
 function requireVendorAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Vendor authentication required' });
+    return res.status(401).json({ error: 'No authorization token provided' });
   }
   
-  const token = authHeader.substring(7);
-  const session = validateSessionToken(token);
+  const token = authHeader.split(' ')[1];
+  const session = vendorSessions[token];
   
   if (!session) {
     return res.status(401).json({ error: 'Invalid or expired session' });
   }
   
-  req.vendorHandle = session.handle;
-  req.vendorName = getVendorName(session.handle);
+  // Check if session expired (24 hours)
+  if (Date.now() - session.created > 24 * 60 * 60 * 1000) {
+    delete vendorSessions[token];
+    return res.status(401).json({ error: 'Session expired' });
+  }
+  
+  // Verify vendor handle matches route parameter
+  if (req.params.handle && session.handle !== req.params.handle) {
+    return res.status(403).json({ error: 'Access denied to this vendor' });
+  }
+  
+  req.vendorSession = session;
   next();
 }
 
-// ===== MIDDLEWARE: Validate Vendor Owns Product =====
+/**
+ * Middleware: Validate product ownership
+ * Ensures the product belongs to the authenticated vendor
+ */
 async function validateProductOwnership(req, res, next) {
-  const productId = req.params.id;
+  const productId = req.params.productId;
+  if (!productId) return next();
   
-  if (!productId) {
-    return next();
+  const vendorName = VENDOR_MAP[req.vendorSession.handle];
+  if (!vendorName) {
+    return res.status(400).json({ error: 'Invalid vendor' });
   }
   
   try {
-    const response = await fetch(`${getBaseUrl()}/products/${productId}.json`, {
-      headers: getShopifyHeaders()
-    });
+    const response = await fetch(
+      `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2024-01/products/${productId}.json`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': req.shopifyToken,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
     
     if (!response.ok) {
       return res.status(404).json({ error: 'Product not found' });
@@ -261,254 +210,591 @@ async function validateProductOwnership(req, res, next) {
     
     const data = await response.json();
     
-    if (data.product.vendor !== req.vendorName) {
-      console.log(`❌ Vendor ${req.vendorHandle} tried to access product owned by ${data.product.vendor}`);
-      return res.status(403).json({ error: 'Access denied - product belongs to different vendor' });
+    if (data.product.vendor !== vendorName) {
+      return res.status(403).json({ error: 'You do not have permission to modify this product' });
     }
     
     req.product = data.product;
     next();
   } catch (error) {
-    console.error('Product validation error:', error);
+    console.error('Error validating product ownership:', error);
     res.status(500).json({ error: 'Failed to validate product ownership' });
   }
 }
 
-// ===== API ROUTES =====
+// =============================================================================
+// SHOPIFY API HELPER
+// =============================================================================
 
-// Check API status
-app.get('/api/status', (req, res) => {
-  const hasShopifyToken = !!getShopifyAccessToken();
-  res.json({ 
-    authenticated: hasShopifyToken,
-    authUrl: hasShopifyToken ? null : `${APP_URL}/auth`,
-    store: SHOPIFY_STORE
+async function shopifyFetch(endpoint, options = {}) {
+  const token = shopifyAccessTokens[SHOPIFY_STORE];
+  if (!token) {
+    throw new Error('Shopify not connected');
+  }
+  
+  const url = `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2024-01${endpoint}`;
+  
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'X-Shopify-Access-Token': token,
+      'Content-Type': 'application/json',
+      ...options.headers
+    }
+  });
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`Shopify API error: ${response.status} ${errorText}`);
+    throw new Error(`Shopify API error: ${response.status}`);
+  }
+  
+  // Handle empty responses (like DELETE)
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
+}
+
+// =============================================================================
+// ROUTES: HOME & HEALTH
+// =============================================================================
+
+/**
+ * GET /
+ * Home page with OAuth connection status and link
+ */
+app.get('/', (req, res) => {
+  const isConnected = !!shopifyAccessTokens[SHOPIFY_STORE];
+  
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>HalfCourse Vendor API</title>
+      <style>
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          max-width: 600px;
+          margin: 50px auto;
+          padding: 20px;
+          background: #f5f5f5;
+        }
+        .card {
+          background: white;
+          border-radius: 12px;
+          padding: 30px;
+          box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 { color: #333; margin-top: 0; }
+        .status {
+          padding: 15px;
+          border-radius: 8px;
+          margin: 20px 0;
+        }
+        .connected { background: #d4edda; color: #155724; }
+        .disconnected { background: #f8d7da; color: #721c24; }
+        .btn {
+          display: inline-block;
+          padding: 12px 24px;
+          background: #ac380b;
+          color: white;
+          text-decoration: none;
+          border-radius: 8px;
+          font-weight: 600;
+        }
+        .btn:hover { background: #8a2d09; }
+        code {
+          background: #f0f0f0;
+          padding: 2px 6px;
+          border-radius: 4px;
+          font-size: 14px;
+        }
+        ul { line-height: 1.8; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>🍽️ HalfCourse Vendor API</h1>
+        
+        <div class="status ${isConnected ? 'connected' : 'disconnected'}">
+          ${isConnected 
+            ? '✅ Connected to Shopify!' 
+            : '❌ Not connected to Shopify'}
+        </div>
+        
+        ${!isConnected ? `
+          <p>Click the button below to connect this API to your Shopify store:</p>
+          <a href="/auth" class="btn">Connect to Shopify</a>
+        ` : `
+          <p>The API is ready to use. Vendors can now log in to their product editors.</p>
+          <h3>Available Endpoints:</h3>
+          <ul>
+            <li><code>GET /health</code> - Health check</li>
+            <li><code>POST /api/vendor/login</code> - Vendor login</li>
+            <li><code>GET /api/vendors/:handle/products</code> - List products</li>
+            <li><code>POST /api/vendors/:handle/products</code> - Create product</li>
+            <li><code>PUT /api/vendors/:handle/products/:id</code> - Update product</li>
+            <li><code>DELETE /api/vendors/:handle/products/:id</code> - Delete product</li>
+          </ul>
+          <p style="margin-top: 20px;">
+            <a href="/auth" class="btn">Re-authenticate</a>
+          </p>
+        `}
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+/**
+ * GET /health
+ * Health check endpoint for monitoring
+ */
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    shopifyConnected: !!shopifyAccessTokens[SHOPIFY_STORE],
+    store: SHOPIFY_STORE,
+    configuredVendors: Object.keys(VENDOR_MAP)
   });
 });
 
-// Get vendor's products - FIXED: proper middleware chain
-app.get('/api/vendors/:handle/products', 
-  requireShopifyAuth,
-  requireVendorAuth,
-  async (req, res) => {
-    const { handle } = req.params;
+// =============================================================================
+// ROUTES: SHOPIFY OAUTH
+// =============================================================================
+
+/**
+ * GET /auth
+ * Start Shopify OAuth flow
+ */
+app.get('/auth', (req, res) => {
+  if (!SHOPIFY_CLIENT_ID) {
+    return res.status(500).send('SHOPIFY_CLIENT_ID not configured');
+  }
+  
+  const redirectUri = `${APP_URL}/auth/callback`;
+  const state = Math.random().toString(36).substring(7);
+  
+  // Store state for validation (in production, use a proper session store)
+  app.locals.oauthState = state;
+  
+  const authUrl = `https://${SHOPIFY_STORE}.myshopify.com/admin/oauth/authorize?` +
+    `client_id=${SHOPIFY_CLIENT_ID}` +
+    `&scope=${SHOPIFY_SCOPES}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&state=${state}`;
+  
+  console.log('Redirecting to Shopify OAuth:', authUrl);
+  res.redirect(authUrl);
+});
+
+/**
+ * GET /auth/callback
+ * Shopify OAuth callback - exchange code for access token
+ */
+app.get('/auth/callback', async (req, res) => {
+  const { code, state, shop } = req.query;
+  
+  // Validate state
+  if (state !== app.locals.oauthState) {
+    return res.status(400).send('Invalid state parameter');
+  }
+  
+  if (!code) {
+    return res.status(400).send('No authorization code received');
+  }
+  
+  try {
+    // Exchange code for access token
+    const tokenResponse = await fetch(
+      `https://${SHOPIFY_STORE}.myshopify.com/admin/oauth/access_token`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: SHOPIFY_CLIENT_ID,
+          client_secret: SHOPIFY_CLIENT_SECRET,
+          code: code
+        })
+      }
+    );
     
-    // Verify the logged-in vendor matches the requested handle
-    if (handle !== req.vendorHandle) {
-      return res.status(403).json({ error: 'Access denied - wrong vendor' });
+    if (!tokenResponse.ok) {
+      const errorText = await tokenResponse.text();
+      console.error('Token exchange failed:', errorText);
+      return res.status(400).send('Failed to exchange code for token: ' + errorText);
     }
     
-    const vendorName = getVendorName(handle);
+    const tokenData = await tokenResponse.json();
+    
+    // Store the access token
+    shopifyAccessTokens[SHOPIFY_STORE] = tokenData.access_token;
+    
+    // Persist to file
+    saveTokens();
+    
+    console.log('✅ Shopify OAuth successful for store:', SHOPIFY_STORE);
+    
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Connected!</title>
+        <style>
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 500px;
+            margin: 100px auto;
+            text-align: center;
+            padding: 20px;
+          }
+          .success {
+            font-size: 60px;
+            margin-bottom: 20px;
+          }
+          h1 { color: #155724; }
+          a {
+            color: #ac380b;
+            text-decoration: none;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="success">✅</div>
+        <h1>Successfully Connected!</h1>
+        <p>The API is now connected to your Shopify store.</p>
+        <p><a href="/">← Back to Home</a></p>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error('OAuth callback error:', error);
+    res.status(500).send('OAuth error: ' + error.message);
+  }
+});
+
+// =============================================================================
+// ROUTES: VENDOR AUTHENTICATION
+// =============================================================================
+
+/**
+ * POST /api/vendor/login
+ * Vendor login - validates password and returns session token
+ */
+app.post('/api/vendor/login', (req, res) => {
+  const { handle, password } = req.body;
+  
+  if (!handle || !password) {
+    return res.status(400).json({ error: 'Handle and password are required' });
+  }
+  
+  // Check if vendor exists in our map
+  if (!VENDOR_MAP[handle]) {
+    return res.status(404).json({ error: 'Vendor not found' });
+  }
+  
+  // Get password from environment variable
+  // Format: VENDOR_LIANDROS_PASSWORD (uppercase handle, hyphens replaced with underscores)
+  const envKey = `VENDOR_${handle.toUpperCase().replace(/-/g, '_')}_PASSWORD`;
+  const expectedPassword = process.env[envKey] || process.env.DEFAULT_VENDOR_PASSWORD;
+  
+  if (!expectedPassword) {
+    console.error(`No password configured for vendor: ${handle} (looked for ${envKey})`);
+    return res.status(500).json({ error: 'Vendor not properly configured' });
+  }
+  
+  if (password !== expectedPassword) {
+    return res.status(401).json({ error: 'Invalid password' });
+  }
+  
+  // Generate session token
+  const sessionToken = Math.random().toString(36).substring(2) + 
+                       Math.random().toString(36).substring(2) +
+                       Date.now().toString(36);
+  
+  // Store session
+  vendorSessions[sessionToken] = {
+    handle: handle,
+    vendorName: VENDOR_MAP[handle],
+    created: Date.now()
+  };
+  
+  console.log(`✅ Vendor logged in: ${handle}`);
+  
+  res.json({
+    success: true,
+    token: sessionToken,
+    vendor: {
+      handle: handle,
+      name: VENDOR_MAP[handle]
+    }
+  });
+});
+
+/**
+ * POST /api/vendor/logout
+ * Vendor logout - invalidates session token
+ */
+app.post('/api/vendor/logout', (req, res) => {
+  const authHeader = req.headers.authorization;
+  
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.split(' ')[1];
+    delete vendorSessions[token];
+  }
+  
+  res.json({ success: true });
+});
+
+// =============================================================================
+// ROUTES: PRODUCTS
+// =============================================================================
+
+/**
+ * GET /api/vendors/:handle/products
+ * List all products for a vendor
+ */
+app.get('/api/vendors/:handle/products', 
+  requireShopifyAuth, 
+  requireVendorAuth,
+  async (req, res) => {
+    const vendorName = VENDOR_MAP[req.params.handle];
+    
+    if (!vendorName) {
+      return res.status(404).json({ error: 'Vendor not found' });
+    }
     
     try {
-      console.log(`📦 Fetching products for vendor: ${vendorName}`);
+      // Fetch all products and filter by vendor
+      // Note: Shopify API doesn't support filtering by vendor directly
+      let allProducts = [];
+      let pageInfo = null;
+      let hasNextPage = true;
       
-      const response = await fetch(
-        `${getBaseUrl()}/products.json?vendor=${encodeURIComponent(vendorName)}&limit=250`,
-        { headers: getShopifyHeaders() }
-      );
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Shopify API error:', response.status, errorText);
-        throw new Error(`Shopify API error: ${response.status}`);
+      while (hasNextPage) {
+        let url = '/products.json?limit=250';
+        if (pageInfo) {
+          url += `&page_info=${pageInfo}`;
+        }
+        
+        const response = await fetch(
+          `https://${SHOPIFY_STORE}.myshopify.com/admin/api/2024-01${url}`,
+          {
+            headers: {
+              'X-Shopify-Access-Token': req.shopifyToken,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        
+        if (!response.ok) {
+          throw new Error(`Shopify API error: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        allProducts = allProducts.concat(data.products);
+        
+        // Check for pagination
+        const linkHeader = response.headers.get('link');
+        if (linkHeader && linkHeader.includes('rel="next"')) {
+          const match = linkHeader.match(/page_info=([^>&]*)/);
+          pageInfo = match ? match[1] : null;
+          hasNextPage = !!pageInfo;
+        } else {
+          hasNextPage = false;
+        }
+        
+        // Safety limit
+        if (allProducts.length > 1000) break;
       }
       
-      const data = await response.json();
-      console.log(`✅ Found ${data.products.length} products for ${vendorName}`);
+      // Filter to only this vendor's products
+      const vendorProducts = allProducts.filter(p => p.vendor === vendorName);
       
-      // Fetch metafields for each product
-      const productsWithMetafields = await Promise.all(
-        data.products.map(async (product) => {
-          try {
-            const metaResponse = await fetch(
-              `${getBaseUrl()}/products/${product.id}/metafields.json`,
-              { headers: getShopifyHeaders() }
-            );
-            const metaData = await metaResponse.json();
-            
-            const metafields = {};
-            (metaData.metafields || []).forEach(mf => {
-              if (mf.namespace === 'custom') {
-                metafields[mf.key] = mf.value;
-              }
-            });
-            
-            return { ...product, metafields };
-          } catch (e) {
-            return { ...product, metafields: {} };
-          }
-        })
-      );
+      console.log(`Found ${vendorProducts.length} products for vendor: ${vendorName}`);
       
-      res.json(productsWithMetafields);
-      
+      res.json({ products: vendorProducts });
     } catch (error) {
       console.error('Error fetching products:', error);
-      res.status(500).json({ error: 'Failed to fetch products: ' + error.message });
+      res.status(500).json({ error: 'Failed to fetch products' });
     }
   }
 );
 
-// Create product
-app.post('/api/vendors/:handle/products', 
+/**
+ * POST /api/vendors/:handle/products
+ * Create a new product for a vendor
+ */
+app.post('/api/vendors/:handle/products',
   requireShopifyAuth,
   requireVendorAuth,
-  upload.any(), 
   async (req, res) => {
-    const { handle } = req.params;
+    const vendorName = VENDOR_MAP[req.params.handle];
     
-    if (handle !== req.vendorHandle) {
-      return res.status(403).json({ error: 'Access denied' });
+    if (!vendorName) {
+      return res.status(404).json({ error: 'Vendor not found' });
     }
     
-    const vendorName = getVendorName(handle);
-    
     try {
-      const { title, description, price, product_type, tagline, serves, prep_time } = req.body;
+      const { title, body_html, price, compare_at_price, images, metafields } = req.body;
       
+      // Build product data
       const productData = {
         product: {
-          title,
-          body_html: description || '',
-          vendor: vendorName,
-          product_type: product_type || '',
-          status: 'active',
+          title: title,
+          body_html: body_html || '',
+          vendor: vendorName, // Always set to the authenticated vendor
+          status: 'draft', // Start as draft
           variants: [{
-            price: parseFloat(price) || 0,
+            price: price || '0.00',
+            compare_at_price: compare_at_price || null,
             inventory_management: null,
-            inventory_policy: 'continue'
+            requires_shipping: false
           }]
         }
       };
       
-      const createResponse = await fetch(`${getBaseUrl()}/products.json`, {
+      // Add images if provided
+      if (images && images.length > 0) {
+        productData.product.images = images.map(img => ({
+          attachment: img.attachment, // Base64 encoded image
+          alt: img.alt || title
+        }));
+      }
+      
+      // Create the product
+      const data = await shopifyFetch('/products.json', {
         method: 'POST',
-        headers: getShopifyHeaders(),
         body: JSON.stringify(productData)
       });
       
-      if (!createResponse.ok) {
-        const errorData = await createResponse.json();
-        throw new Error(errorData.errors || 'Failed to create product');
+      // Add metafields if provided
+      if (metafields && data.product) {
+        for (const mf of metafields) {
+          try {
+            await shopifyFetch(`/products/${data.product.id}/metafields.json`, {
+              method: 'POST',
+              body: JSON.stringify({
+                metafield: {
+                  namespace: mf.namespace || 'custom',
+                  key: mf.key,
+                  value: mf.value,
+                  type: mf.type || 'single_line_text_field'
+                }
+              })
+            });
+          } catch (mfError) {
+            console.error('Error adding metafield:', mfError);
+          }
+        }
       }
       
-      const created = await createResponse.json();
-      const productId = created.product.id;
+      console.log(`✅ Created product: ${data.product.title} for vendor: ${vendorName}`);
       
-      console.log(`✅ Created product ${productId} for vendor ${vendorName}`);
-      
-      // Add to vendor's collection
-      await addProductToVendorCollection(handle, productId);
-      
-      // Set metafields
-      if (tagline || serves || prep_time) {
-        await setProductMetafields(productId, { tagline, serves, prep_time });
-      }
-      
-      // Upload images
-      const imageFiles = req.files?.filter(f => f.fieldname.startsWith('image_')) || [];
-      for (const file of imageFiles) {
-        await uploadProductImage(productId, file);
-      }
-      
-      res.json({ success: true, product: created.product });
-      
+      res.json(data);
     } catch (error) {
       console.error('Error creating product:', error);
-      res.status(500).json({ error: error.message || 'Failed to create product' });
+      res.status(500).json({ error: 'Failed to create product' });
     }
   }
 );
 
-// Update product
-app.put('/api/vendors/:handle/products/:id', 
+/**
+ * PUT /api/vendors/:handle/products/:productId
+ * Update an existing product
+ */
+app.put('/api/vendors/:handle/products/:productId',
   requireShopifyAuth,
   requireVendorAuth,
   validateProductOwnership,
-  upload.any(), 
   async (req, res) => {
-    const { handle, id } = req.params;
-    
-    if (handle !== req.vendorHandle) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    const { productId } = req.params;
     
     try {
       const { 
         title, 
-        description, 
+        body_html, 
         price, 
-        compare_price,
-        product_type, 
-        available,
-        tagline, 
-        serves, 
-        prep_time,
-        images_to_delete 
+        compare_at_price, 
+        status,
+        metafields,
+        images_to_delete
       } = req.body;
       
-      const updateData = {
-        product: {
-          id,
-          title,
-          body_html: description || '',
-          product_type: product_type || '',
-          status: available === 'true' || available === true ? 'active' : 'draft'
-        }
-      };
+      // Build update data
+      const updateData = { product: { id: productId } };
       
-      const updateResponse = await fetch(`${getBaseUrl()}/products/${id}.json`, {
+      if (title !== undefined) updateData.product.title = title;
+      if (body_html !== undefined) updateData.product.body_html = body_html;
+      if (status !== undefined) updateData.product.status = status;
+      
+      // Update variant pricing if provided
+      if (price !== undefined || compare_at_price !== undefined) {
+        const variant = req.product.variants[0];
+        updateData.product.variants = [{
+          id: variant.id,
+          price: price !== undefined ? price : variant.price,
+          compare_at_price: compare_at_price !== undefined ? compare_at_price : variant.compare_at_price
+        }];
+      }
+      
+      // Update the product
+      const data = await shopifyFetch(`/products/${productId}.json`, {
         method: 'PUT',
-        headers: getShopifyHeaders(),
         body: JSON.stringify(updateData)
       });
       
-      if (!updateResponse.ok) {
-        throw new Error('Failed to update product');
-      }
-      
-      // Update variant price
-      const product = req.product;
-      const variantId = product.variants[0].id;
-      
-      const variantData = {
-        variant: {
-          id: variantId,
-          price: parseFloat(price) || 0,
-          compare_at_price: compare_price ? parseFloat(compare_price) : null
-        }
-      };
-      
-      await fetch(`${getBaseUrl()}/variants/${variantId}.json`, {
-        method: 'PUT',
-        headers: getShopifyHeaders(),
-        body: JSON.stringify(variantData)
-      });
-      
-      // Update metafields
-      await setProductMetafields(id, { tagline, serves, prep_time });
-      
-      // Delete images
-      if (images_to_delete) {
-        const imagesToDelete = JSON.parse(images_to_delete);
-        for (const imageId of imagesToDelete) {
-          await fetch(`${getBaseUrl()}/products/${id}/images/${imageId}.json`, {
-            method: 'DELETE',
-            headers: getShopifyHeaders()
-          });
+      // Delete images if requested
+      if (images_to_delete && images_to_delete.length > 0) {
+        for (const imageId of images_to_delete) {
+          try {
+            await shopifyFetch(`/products/${productId}/images/${imageId}.json`, {
+              method: 'DELETE'
+            });
+          } catch (imgError) {
+            console.error('Error deleting image:', imgError);
+          }
         }
       }
       
-      // Upload new images
-      const newImages = req.files?.filter(f => f.fieldname.startsWith('new_image_')) || [];
-      for (const file of newImages) {
-        await uploadProductImage(id, file);
+      // Update metafields if provided
+      if (metafields) {
+        for (const mf of metafields) {
+          try {
+            if (mf.id) {
+              // Update existing metafield
+              await shopifyFetch(`/metafields/${mf.id}.json`, {
+                method: 'PUT',
+                body: JSON.stringify({
+                  metafield: {
+                    id: mf.id,
+                    value: mf.value
+                  }
+                })
+              });
+            } else {
+              // Create new metafield
+              await shopifyFetch(`/products/${productId}/metafields.json`, {
+                method: 'POST',
+                body: JSON.stringify({
+                  metafield: {
+                    namespace: mf.namespace || 'custom',
+                    key: mf.key,
+                    value: mf.value,
+                    type: mf.type || 'single_line_text_field'
+                  }
+                })
+              });
+            }
+          } catch (mfError) {
+            console.error('Error updating metafield:', mfError);
+          }
+        }
       }
       
-      console.log(`✅ Updated product ${id}`);
-      res.json({ success: true });
+      console.log(`✅ Updated product: ${productId}`);
       
+      res.json(data);
     } catch (error) {
       console.error('Error updating product:', error);
       res.status(500).json({ error: 'Failed to update product' });
@@ -516,31 +802,25 @@ app.put('/api/vendors/:handle/products/:id',
   }
 );
 
-// Delete product
-app.delete('/api/vendors/:handle/products/:id', 
+/**
+ * DELETE /api/vendors/:handle/products/:productId
+ * Delete a product
+ */
+app.delete('/api/vendors/:handle/products/:productId',
   requireShopifyAuth,
   requireVendorAuth,
   validateProductOwnership,
   async (req, res) => {
-    const { handle, id } = req.params;
-    
-    if (handle !== req.vendorHandle) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    const { productId } = req.params;
     
     try {
-      const response = await fetch(`${getBaseUrl()}/products/${id}.json`, {
-        method: 'DELETE',
-        headers: getShopifyHeaders()
+      await shopifyFetch(`/products/${productId}.json`, {
+        method: 'DELETE'
       });
       
-      if (!response.ok) {
-        throw new Error('Failed to delete product');
-      }
+      console.log(`✅ Deleted product: ${productId}`);
       
-      console.log(`✅ Deleted product ${id}`);
-      res.json({ success: true });
-      
+      res.json({ success: true, deleted: productId });
     } catch (error) {
       console.error('Error deleting product:', error);
       res.status(500).json({ error: 'Failed to delete product' });
@@ -548,155 +828,144 @@ app.delete('/api/vendors/:handle/products/:id',
   }
 );
 
-// ===== HELPER FUNCTIONS =====
-
-async function setProductMetafields(productId, fields) {
-  const metafields = [];
-  
-  if (fields.tagline !== undefined) {
-    metafields.push({
-      namespace: 'custom',
-      key: 'tagline',
-      value: fields.tagline || '',
-      type: 'single_line_text_field'
-    });
-  }
-  
-  if (fields.serves !== undefined) {
-    metafields.push({
-      namespace: 'custom',
-      key: 'serves',
-      value: fields.serves || '',
-      type: 'single_line_text_field'
-    });
-  }
-  
-  if (fields.prep_time !== undefined) {
-    metafields.push({
-      namespace: 'custom',
-      key: 'prep_time',
-      value: fields.prep_time || '',
-      type: 'single_line_text_field'
-    });
-  }
-  
-  for (const metafield of metafields) {
-    try {
-      const existingResponse = await fetch(
-        `${getBaseUrl()}/products/${productId}/metafields.json?namespace=custom&key=${metafield.key}`,
-        { headers: getShopifyHeaders() }
-      );
-      const existingData = await existingResponse.json();
-      
-      if (existingData.metafields && existingData.metafields.length > 0) {
-        const existingId = existingData.metafields[0].id;
-        await fetch(`${getBaseUrl()}/metafields/${existingId}.json`, {
-          method: 'PUT',
-          headers: getShopifyHeaders(),
-          body: JSON.stringify({ metafield: { ...metafield, id: existingId } })
-        });
-      } else {
-        await fetch(`${getBaseUrl()}/products/${productId}/metafields.json`, {
-          method: 'POST',
-          headers: getShopifyHeaders(),
-          body: JSON.stringify({ metafield })
-        });
-      }
-    } catch (e) {
-      console.error('Error setting metafield:', e);
-    }
-  }
-}
-
-async function uploadProductImage(productId, file) {
-  const base64Image = file.buffer.toString('base64');
-  
-  const imageData = {
-    image: {
-      attachment: base64Image,
-      filename: file.originalname
-    }
-  };
-  
-  await fetch(`${getBaseUrl()}/products/${productId}/images.json`, {
-    method: 'POST',
-    headers: getShopifyHeaders(),
-    body: JSON.stringify(imageData)
-  });
-}
-
-async function addProductToVendorCollection(vendorHandle, productId) {
-  try {
-    const collectionsResponse = await fetch(
-      `${getBaseUrl()}/custom_collections.json?handle=${vendorHandle}`,
-      { headers: getShopifyHeaders() }
-    );
-    const collectionsData = await collectionsResponse.json();
+/**
+ * POST /api/vendors/:handle/products/:productId/images
+ * Upload a new image to a product
+ */
+app.post('/api/vendors/:handle/products/:productId/images',
+  requireShopifyAuth,
+  requireVendorAuth,
+  validateProductOwnership,
+  upload.single('image'),
+  async (req, res) => {
+    const { productId } = req.params;
     
-    if (collectionsData.custom_collections && collectionsData.custom_collections.length > 0) {
-      const collectionId = collectionsData.custom_collections[0].id;
+    try {
+      let imageData;
       
-      await fetch(`${getBaseUrl()}/collects.json`, {
-        method: 'POST',
-        headers: getShopifyHeaders(),
-        body: JSON.stringify({
-          collect: {
-            product_id: productId,
-            collection_id: collectionId
+      if (req.file) {
+        // File upload
+        imageData = {
+          image: {
+            attachment: req.file.buffer.toString('base64'),
+            alt: req.body.alt || ''
           }
-        })
+        };
+      } else if (req.body.attachment) {
+        // Base64 in body
+        imageData = {
+          image: {
+            attachment: req.body.attachment,
+            alt: req.body.alt || ''
+          }
+        };
+      } else if (req.body.src) {
+        // URL
+        imageData = {
+          image: {
+            src: req.body.src,
+            alt: req.body.alt || ''
+          }
+        };
+      } else {
+        return res.status(400).json({ error: 'No image provided' });
+      }
+      
+      const data = await shopifyFetch(`/products/${productId}/images.json`, {
+        method: 'POST',
+        body: JSON.stringify(imageData)
       });
-      console.log(`✅ Added product ${productId} to collection ${vendorHandle}`);
+      
+      console.log(`✅ Added image to product: ${productId}`);
+      
+      res.json(data);
+    } catch (error) {
+      console.error('Error uploading image:', error);
+      res.status(500).json({ error: 'Failed to upload image' });
     }
-  } catch (error) {
-    console.error('Error adding product to collection:', error);
   }
-}
+);
 
-// ===== HEALTH CHECK =====
-app.get('/health', (req, res) => {
-  const hasShopifyToken = !!getShopifyAccessToken();
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    shopifyConnected: hasShopifyToken,
-    store: SHOPIFY_STORE
+/**
+ * DELETE /api/vendors/:handle/products/:productId/images/:imageId
+ * Delete an image from a product
+ */
+app.delete('/api/vendors/:handle/products/:productId/images/:imageId',
+  requireShopifyAuth,
+  requireVendorAuth,
+  validateProductOwnership,
+  async (req, res) => {
+    const { productId, imageId } = req.params;
+    
+    try {
+      await shopifyFetch(`/products/${productId}/images/${imageId}.json`, {
+        method: 'DELETE'
+      });
+      
+      console.log(`✅ Deleted image ${imageId} from product: ${productId}`);
+      
+      res.json({ success: true, deleted: imageId });
+    } catch (error) {
+      console.error('Error deleting image:', error);
+      res.status(500).json({ error: 'Failed to delete image' });
+    }
+  }
+);
+
+/**
+ * GET /api/vendors/:handle/products/:productId/metafields
+ * Get metafields for a product
+ */
+app.get('/api/vendors/:handle/products/:productId/metafields',
+  requireShopifyAuth,
+  requireVendorAuth,
+  validateProductOwnership,
+  async (req, res) => {
+    const { productId } = req.params;
+    
+    try {
+      const data = await shopifyFetch(`/products/${productId}/metafields.json`);
+      res.json(data);
+    } catch (error) {
+      console.error('Error fetching metafields:', error);
+      res.status(500).json({ error: 'Failed to fetch metafields' });
+    }
+  }
+);
+
+// =============================================================================
+// ERROR HANDLING
+// =============================================================================
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: 'Not found',
+    message: `The endpoint ${req.method} ${req.path} does not exist`
   });
 });
 
-// Home page
-app.get('/', (req, res) => {
-  const hasToken = !!getShopifyAccessToken();
-  res.send(`
-    <html>
-      <head><title>HalfCourse Vendor API</title></head>
-      <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-        <h1>HalfCourse Vendor API</h1>
-        ${hasToken ? 
-          '<p style="color: green;">✅ Connected to Shopify</p>' : 
-          `<p style="color: orange;">⚠️ Not connected</p>
-           <a href="/auth" style="display: inline-block; padding: 12px 24px; background: #ac380b; color: white; text-decoration: none; border-radius: 8px;">Connect to Shopify</a>`
-        }
-        <hr style="margin: 30px 0;">
-        <p style="color: #666;">API Endpoints:</p>
-        <ul style="text-align: left; max-width: 400px; margin: 0 auto;">
-          <li>POST /api/vendor/login - Vendor login</li>
-          <li>GET /api/vendors/:handle/products - List products</li>
-          <li>POST /api/vendors/:handle/products - Create product</li>
-          <li>PUT /api/vendors/:handle/products/:id - Update product</li>
-          <li>DELETE /api/vendors/:handle/products/:id - Delete product</li>
-        </ul>
-      </body>
-    </html>
-  `);
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: err.message 
+  });
 });
 
-// ===== START SERVER =====
-const PORT = process.env.PORT || 3000;
+// =============================================================================
+// START SERVER
+// =============================================================================
+
 app.listen(PORT, () => {
-  console.log(`🚀 HalfCourse Vendor API running on port ${PORT}`);
-  console.log(`📍 Auth URL: ${APP_URL}/auth`);
-  console.log(`🏪 Store: ${SHOPIFY_STORE}`);
+  console.log('');
+  console.log('🍽️  HalfCourse Vendor API');
+  console.log('========================');
+  console.log(`Server running on port ${PORT}`);
+  console.log(`App URL: ${APP_URL}`);
+  console.log(`Store: ${SHOPIFY_STORE}`);
+  console.log(`Shopify Connected: ${!!shopifyAccessTokens[SHOPIFY_STORE]}`);
+  console.log(`Configured vendors: ${Object.keys(VENDOR_MAP).join(', ')}`);
+  console.log('');
 });
-
-module.exports = app;
