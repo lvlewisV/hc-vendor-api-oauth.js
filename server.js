@@ -11,7 +11,9 @@
  * - Product CRUD operations (filtered by vendor)
  * - Image upload/delete
  * - Metafields support
- * - Collection/Store settings management (NEW)
+ * - Collection/Store settings management
+ * - Email campaign sending via Omnisend (NEW)
+ * - Subscriber count from Omnisend (NEW)
  * 
  * Deploy to: Render.com
  * Repository: github.com/lvlewisV/hc-vendor-api-oauth.js
@@ -341,6 +343,42 @@ async function shopifyFetch(endpoint, options = {}) {
 }
 
 // =============================================================================
+// OMNISEND API HELPER
+// =============================================================================
+
+/**
+ * Returns the Omnisend tag used to segment contacts for a given vendor.
+ * Contacts must be tagged with this value at subscribe time (e.g. "liandros").
+ */
+function getVendorTag(handle) {
+  return handle.toLowerCase().replace(/\s+/g, '-');
+}
+
+/**
+ * Strips HTML tags from a string to produce a plain-text email fallback.
+ * Omnisend requires both HTML and plain-text content.
+ */
+function stripHtmlToText(html) {
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<\/td>/gi, '  ')
+    .replace(/<\/h[1-6]>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// =============================================================================
 // ROUTES: HOME & HEALTH
 // =============================================================================
 
@@ -423,6 +461,8 @@ app.get('/', (req, res) => {
             <li><code>GET /api/vendors/:handle/settings</code> - Get store settings</li>
             <li><code>PUT /api/vendors/:handle/settings</code> - Update store settings</li>
             <li><code>POST /api/vendors/:handle/settings/images</code> - Upload store images</li>
+            <li><code>GET /api/vendors/:handle/subscribers/count</code> - Subscriber count</li>
+            <li><code>POST /api/vendors/:handle/email/send</code> - Send email campaign</li>
           </ul>
           <p style="margin-top: 20px;">
             <a href="/auth" class="btn">Re-authenticate</a>
@@ -443,6 +483,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     shopifyConnected: !!shopifyAccessTokens[SHOPIFY_STORE],
+    omnisendConfigured: !!process.env.OMNISEND_API_KEY,
     store: SHOPIFY_STORE,
     configuredVendors: Object.keys(VENDOR_MAP)
   });
@@ -655,7 +696,6 @@ app.get('/api/vendors/:handle/products',
     
     try {
       // Fetch all products and filter by vendor
-      // Note: Shopify API doesn't support filtering by vendor directly
       let allProducts = [];
       let pageInfo = null;
       let hasNextPage = true;
@@ -1189,9 +1229,6 @@ app.delete('/api/vendors/:handle/settings/metafields/:metafieldId',
  * POST /api/vendors/:handle/settings/images
  * Upload an image for store settings (logo, banner, story images)
  * Returns the Shopify CDN URL for the uploaded image
- * 
- * UPDATED: Now uses imageType directly as metafield key (no _image suffix)
- * to match existing Shopify metafield names like 'vendor_logo', 'banner', etc.
  */
 app.post('/api/vendors/:handle/settings/images',
   requireShopifyAuth,
@@ -1200,7 +1237,7 @@ app.post('/api/vendors/:handle/settings/images',
   upload.single('image'),
   async (req, res) => {
     try {
-      const { imageType, alt } = req.body; // imageType: 'vendor_logo', 'banner', 'story_bg_image', 'left_image_1', etc.
+      const { imageType, alt } = req.body;
       
       if (!imageType) {
         return res.status(400).json({ error: 'imageType is required' });
@@ -1217,14 +1254,10 @@ app.post('/api/vendors/:handle/settings/images',
       }
       
       const collectionId = req.collection.id;
-      
-      // FIXED: Use imageType directly as the metafield key
-      // This matches existing metafield names like 'vendor_logo', 'banner', 'story_bg_image'
       const metafieldKey = imageType;
       
       // Handle collection image separately
       if (imageType === 'collection_image') {
-        // Update collection image directly
         const collectionEndpoint = req.collectionType === 'smart' 
           ? `/smart_collections/${collectionId}.json`
           : `/custom_collections/${collectionId}.json`;
@@ -1247,10 +1280,7 @@ app.post('/api/vendors/:handle/settings/images',
         });
       }
       
-      // For other image types, create a temporary product to upload to Shopify's CDN
-      // then get the CDN URL and delete the product
-      
-      // Create temporary product with image
+      // Create temporary product to get a Shopify CDN URL
       const tempProduct = await shopifyFetch('/products.json', {
         method: 'POST',
         body: JSON.stringify({
@@ -1276,11 +1306,10 @@ app.post('/api/vendors/:handle/settings/images',
         method: 'DELETE'
       });
       
-      // Check if metafield exists
+      // Check if metafield exists and upsert
       const existingMetafields = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
       const existingMf = existingMetafields.metafields?.find(mf => mf.key === metafieldKey && mf.namespace === 'custom');
       
-      // Store the CDN URL in metafield
       let metafieldResult;
       if (existingMf) {
         metafieldResult = await shopifyFetch(`/metafields/${existingMf.id}.json`, {
@@ -1319,8 +1348,6 @@ app.post('/api/vendors/:handle/settings/images',
 /**
  * DELETE /api/vendors/:handle/settings/images/:imageType
  * Delete an image metafield
- * 
- * UPDATED: Now uses imageType directly as metafield key (no _image suffix)
  */
 app.delete('/api/vendors/:handle/settings/images/:imageType',
   requireShopifyAuth,
@@ -1331,11 +1358,8 @@ app.delete('/api/vendors/:handle/settings/images/:imageType',
     
     try {
       const collectionId = req.collection.id;
-      
-      // FIXED: Use imageType directly as the metafield key
       const metafieldKey = imageType;
       
-      // Find the metafield
       const existingMetafields = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
       const existingMf = existingMetafields.metafields?.find(mf => mf.key === metafieldKey && mf.namespace === 'custom');
       
@@ -1353,6 +1377,199 @@ app.delete('/api/vendors/:handle/settings/images/:imageType',
     } catch (error) {
       console.error('Error deleting store image:', error);
       res.status(500).json({ error: 'Failed to delete image' });
+    }
+  }
+);
+
+// =============================================================================
+// ROUTES: EMAIL CAMPAIGNS (OMNISEND)
+// =============================================================================
+
+/**
+ * GET /api/vendors/:handle/subscribers/count
+ * Returns the number of subscribed contacts tagged with this vendor's handle.
+ * Used by the email builder to show "X subscribers will receive this."
+ *
+ * Requires env: OMNISEND_API_KEY
+ */
+app.get('/api/vendors/:handle/subscribers/count',
+  requireShopifyAuth,
+  requireVendorAuth,
+  async (req, res) => {
+    const { handle } = req.params;
+    const tag = getVendorTag(handle);
+    const apiKey = process.env.OMNISEND_API_KEY;
+
+    if (!apiKey) {
+      return res.json({ count: 0, note: 'OMNISEND_API_KEY not configured' });
+    }
+
+    try {
+      const url = `https://api.omnisend.com/v3/contacts?tags=${encodeURIComponent(tag)}&status=subscribed&limit=1`;
+
+      const response = await fetch(url, {
+        headers: {
+          'X-API-KEY': apiKey,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error('[Omnisend] subscriber count error:', errText);
+        return res.json({ count: 0 });
+      }
+
+      const data = await response.json();
+      const count = data.paging?.totalCount ?? (data.contacts?.length ?? 0);
+
+      console.log(`[Omnisend] ${handle} subscriber count: ${count}`);
+      return res.json({ count });
+    } catch (err) {
+      console.error('[Omnisend] subscriber count fetch failed:', err.message);
+      return res.json({ count: 0 });
+    }
+  }
+);
+
+/**
+ * POST /api/vendors/:handle/email/send
+ * Creates and schedules an email campaign via Omnisend.
+ * Targets contacts tagged with the vendor's handle.
+ *
+ * Body:
+ *   subject      {string}  Subject line (required)
+ *   previewText  {string}  Inbox preview snippet
+ *   htmlContent  {string}  Full rendered HTML from the email builder
+ *
+ * Requires env: OMNISEND_API_KEY, OMNISEND_FROM_EMAIL
+ */
+app.post('/api/vendors/:handle/email/send',
+  requireShopifyAuth,
+  requireVendorAuth,
+  async (req, res) => {
+    const { handle } = req.params;
+    const { subject, previewText, htmlContent } = req.body;
+    const tag = getVendorTag(handle);
+    const apiKey = process.env.OMNISEND_API_KEY;
+
+    // ── Validation ────────────────────────────────────────────
+    if (!subject || !subject.trim()) {
+      return res.status(400).json({ error: 'Subject line is required.' });
+    }
+    if (!htmlContent || htmlContent.length < 100) {
+      return res.status(400).json({ error: 'Email content is missing or too short.' });
+    }
+    if (!apiKey) {
+      return res.status(500).json({
+        error: 'OMNISEND_API_KEY is not configured. Add it to your Render environment variables.',
+      });
+    }
+
+    // ── Sender identity ───────────────────────────────────────
+    const vendorDisplayName = VENDOR_MAP[handle] || handle;
+    const fromName  = `${vendorDisplayName} @ HalfCourse`;
+    const fromEmail = process.env.OMNISEND_FROM_EMAIL || 'hello@halfcourse.com';
+
+    try {
+      // ── Step 1: Create campaign ───────────────────────────────
+      const campaignPayload = {
+        name: `${vendorDisplayName} — ${subject.substring(0, 50)} (${new Date().toLocaleDateString('en-US')})`,
+        type: 'regular',
+        options: {
+          trackLinks: true,
+        },
+        sendingSettings: {
+          contactsFilter: {
+            tags: [tag],
+            status: 'subscribed',
+          },
+          fromName:     fromName,
+          fromEmail:    fromEmail,
+          replyToEmail: process.env.OMNISEND_REPLY_EMAIL || fromEmail,
+        },
+        content: {
+          subject:          subject.trim(),
+          preheader:        previewText ? previewText.trim() : '',
+          htmlContent:      htmlContent,
+          plainTextContent: stripHtmlToText(htmlContent),
+        },
+      };
+
+      const createRes = await fetch('https://api.omnisend.com/v3/campaigns', {
+        method: 'POST',
+        headers: {
+          'X-API-KEY': apiKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(campaignPayload),
+      });
+
+      const createText = await createRes.text();
+      let createData;
+      try { createData = JSON.parse(createText); } catch (_) { createData = {}; }
+
+      if (!createRes.ok) {
+        console.error('[Omnisend] create campaign failed:', createText);
+        const omniError = createData?.error?.message
+          || createData?.message
+          || `Omnisend returned status ${createRes.status}`;
+        return res.status(502).json({ error: 'Campaign creation failed: ' + omniError });
+      }
+
+      const campaignId = createData.campaignID || createData.id;
+      if (!campaignId) {
+        console.error('[Omnisend] no campaignID in response:', createData);
+        return res.status(502).json({ error: 'Omnisend did not return a campaign ID.' });
+      }
+
+      console.log(`[Email] Campaign created: ${campaignId} for vendor ${handle}`);
+
+      // ── Step 2: Schedule for immediate send ───────────────────
+      // scheduledFor set 60 seconds ahead to give Omnisend time to process
+      const sendAt = new Date(Date.now() + 60000).toISOString();
+
+      const scheduleRes = await fetch(
+        `https://api.omnisend.com/v3/campaigns/${campaignId}/actions/start`,
+        {
+          method: 'POST',
+          headers: {
+            'X-API-KEY': apiKey,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ scheduledFor: sendAt }),
+        }
+      );
+
+      const scheduleText = await scheduleRes.text();
+      let scheduleData;
+      try { scheduleData = JSON.parse(scheduleText); } catch (_) { scheduleData = {}; }
+
+      if (!scheduleRes.ok) {
+        console.error('[Omnisend] schedule campaign failed:', scheduleText);
+        const omniError = scheduleData?.error?.message
+          || scheduleData?.message
+          || `Status ${scheduleRes.status}`;
+        // Campaign created but not scheduled — return partial info
+        return res.status(502).json({
+          error: 'Campaign was created but could not be scheduled: ' + omniError,
+          campaignId,
+          hint: 'You can manually start it from your Omnisend dashboard.',
+        });
+      }
+
+      console.log(`[Email] Campaign scheduled: ${campaignId} at ${sendAt}`);
+
+      return res.json({
+        success: true,
+        campaignId,
+        scheduledFor: sendAt,
+        message: 'Campaign created and scheduled successfully.',
+      });
+
+    } catch (err) {
+      console.error('[Email] send error:', err.message);
+      return res.status(500).json({ error: 'Internal server error: ' + err.message });
     }
   }
 );
@@ -1390,6 +1607,7 @@ app.listen(PORT, () => {
   console.log(`App URL: ${APP_URL}`);
   console.log(`Store: ${SHOPIFY_STORE}`);
   console.log(`Shopify Connected: ${!!shopifyAccessTokens[SHOPIFY_STORE]}`);
+  console.log(`Omnisend Configured: ${!!process.env.OMNISEND_API_KEY}`);
   console.log(`Configured vendors: ${Object.keys(VENDOR_MAP).join(', ')}`);
   console.log('');
 });
