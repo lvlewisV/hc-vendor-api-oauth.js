@@ -34,6 +34,28 @@ const path = require('path');
 
 const app = express();
 
+const sql = require('mssql');
+
+const sqlConfig = {
+  user: process.env.SQL_USERNAME,
+  password: process.env.SQL_PASSWORD,
+  server: process.env.SQL_SERVER,
+  database: process.env.SQL_DATABASE,
+  options: {
+    encrypt: true,
+    trustServerCertificate: false
+  }
+};
+
+let pool;
+
+async function getSqlPool() {
+  if (!pool) {
+    pool = await sql.connect(sqlConfig);
+    console.log("✅ Connected to Azure SQL");
+  }
+  return pool;
+}
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
