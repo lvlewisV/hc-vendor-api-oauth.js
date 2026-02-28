@@ -1636,7 +1636,7 @@ app.post('/api/vendors/:handle/email/send',
         campaignId,
         sent,
         failed,
-        message: `Campaign sent to ${sent} subscriber${sent !== 1 ? 's' : ''}${failed ? \` (${failed} failed)\` : ''}.`,
+        message: `Campaign sent to ${sent} subscriber${sent !== 1 ? 's' : ''}` + (failed ? ` (${failed} failed)` : '') + '.',
       });
 
     } catch (err) {
