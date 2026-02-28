@@ -1,9 +1,6 @@
 /**
  * HalfCourse Vendor Product Editor API
- * 
- * A Node.js/Express backend that allows vendors to manage their products
- * and store settings without needing Shopify admin access.
- * 
+ *
  * Features:
  * - Shopify OAuth authentication
  * - Token persistence (survives server restarts)
@@ -12,25 +9,46 @@
  * - Image upload/delete
  * - Metafields support
  * - Collection/Store settings management
- * - Email campaign sending via Omnisend
- * - Email test send via Omnisend (NEW)
- * - Subscriber count from Omnisend
- * 
+ * - Email campaigns via Amazon SES + Azure SQL (all sends)
+ * - Subscriber counts from Azure SQL
+ * - SQL-driven audience segments
+ * - HMAC-signed one-click unsubscribe (Gmail/Yahoo compliant)
+ * - SNS webhook for bounce/complaint suppression
+ * - Campaign logging to email_send_log
+ *
  * Deploy to: Render.com
  * Repository: github.com/lvlewisV/hc-vendor-api-oauth.js
  */
 
 const { SESClient, SendEmailCommand } = require("@aws-sdk/client-ses");
+const sql  = require("mssql");
+const crypto = require("crypto");
 
-const ses = new SESClient({
-  region: process.env.AWS_REGION
-});
+// ── SES client ────────────────────────────────────────────────────────────────
+const ses = new SESClient({ region: process.env.AWS_REGION || "us-east-1" });
+
+// ── Azure SQL pool (lazy-initialised) ─────────────────────────────────────────
+let sqlPool = null;
+async function getPool() {
+  if (sqlPool) return sqlPool;
+  sqlPool = await sql.connect({
+    server:   process.env.SQL_SERVER,
+    database: process.env.SQL_DATABASE,
+    user:     process.env.SQL_USERNAME,
+    password: process.env.SQL_PASSWORD,
+    options:  { encrypt: true, trustServerCertificate: false },
+    pool:     { max: 10, min: 0, idleTimeoutMillisMs: 30000 },
+  });
+  console.log("✅ Azure SQL pool connected");
+  return sqlPool;
+}
+
 const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
-const multer = require('multer');
-const fs = require('fs');
-const path = require('path');
+const cors    = require('cors');
+const fetch   = require('node-fetch');
+const multer  = require('multer');
+const fs      = require('fs');
+const path    = require('path');
 
 const app = express();
 
@@ -349,20 +367,69 @@ async function shopifyFetch(endpoint, options = {}) {
 }
 
 // =============================================================================
-// OMNISEND API HELPER
+// EMAIL HELPERS (SES + AZURE SQL)
 // =============================================================================
 
 /**
- * Returns the Omnisend tag used to segment contacts for a given vendor.
- * Contacts must be tagged with this value at subscribe time (e.g. "liandros").
+ * Returns the vendor tag / segment key for a given handle.
+ * Contacts must be subscribed to vendor_subscriptions with this vendor_handle.
  */
 function getVendorTag(handle) {
   return handle.toLowerCase().replace(/\s+/g, '-');
 }
 
 /**
+ * Generate an HMAC-SHA256 signed unsubscribe token for a contact.
+ * Token format: base64url(email):base64url(hmac)
+ */
+function signUnsubscribeToken(email) {
+  const secret = process.env.SES_UNSUBSCRIBE_SECRET || process.env.SHOPIFY_CLIENT_SECRET;
+  const hmac = crypto.createHmac("sha256", secret).update(email).digest("base64url");
+  return `${Buffer.from(email).toString("base64url")}:${hmac}`;
+}
+
+/**
+ * Verify an unsubscribe token. Returns email string or null if invalid.
+ */
+function verifyUnsubscribeToken(token) {
+  try {
+    const [emailB64, hmac] = token.split(":");
+    const email = Buffer.from(emailB64, "base64url").toString();
+    const expected = crypto.createHmac("sha256", process.env.SES_UNSUBSCRIBE_SECRET || process.env.SHOPIFY_CLIENT_SECRET)
+      .update(email).digest("base64url");
+    if (hmac !== expected) return null;
+    return email;
+  } catch (_) { return null; }
+}
+
+/**
+ * Build the SQL WHERE clause for an audience segment.
+ * Segment values must match the options in the frontend dropdown.
+ */
+function buildAudienceQuery(vendorHandle, audience) {
+  const base = `
+    FROM contacts c
+    JOIN vendor_subscriptions vs ON vs.contact_id = c.id
+    WHERE vs.vendor_handle = @vendorHandle
+      AND vs.status = 'subscribed'
+      AND c.email IS NOT NULL
+      AND c.email NOT IN (SELECT email FROM suppressions WHERE vendor_handle = @vendorHandle OR vendor_handle IS NULL)
+  `;
+  switch (audience) {
+    case 'newsletter':
+      return base + ` AND vs.source = 'newsletter'`;
+    case 'sms_opted_in':
+      return base + ` AND c.sms_status = 'subscribed'`;
+    case 'recent_buyers':
+      return base + ` AND c.last_order_at >= DATEADD(day, -30, GETUTCDATE())`;
+    case 'all':
+    default:
+      return base;
+  }
+}
+
+/**
  * Strips HTML tags from a string to produce a plain-text email fallback.
- * Omnisend requires both HTML and plain-text content.
  */
 function stripHtmlToText(html) {
   return html
@@ -490,9 +557,10 @@ app.get('/health', (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     shopifyConnected: !!shopifyAccessTokens[SHOPIFY_STORE],
-    omnisendConfigured: !!process.env.OMNISEND_API_KEY,
+    sesConfigured: !!process.env.AWS_REGION && !!process.env.SES_FROM_EMAIL,
+    sqlConfigured: !!process.env.SQL_SERVER && !!process.env.SQL_DATABASE,
     store: SHOPIFY_STORE,
-    configuredVendors: Object.keys(VENDOR_MAP)
+    configuredVendors: Object.keys(VENDOR_MAP),
   });
 });
 
@@ -1341,35 +1409,10 @@ app.post('/api/vendors/:handle/settings/images',
         uploadedImageUrl = newBucket.product.images[0].src;
       }
 
-      // For email block images, skip metafield storage - CDN URL is enough.
-      if (imageType.startsWith('email_block_')) {
-        console.log(`Uploaded email block image (${imageType}) for vendor: ${req.params.handle}`);
-        return res.json({ success: true, imageType, url: uploadedImageUrl });
-      }
-
-      // For email_logo, persist the URL back to the vendor_logo metafield so the
-      // builder pre-loads the correct permanent URL on next session.
-      if (imageType === 'email_logo') {
-        try {
-          const existingMfs = await shopifyFetch(`/collections/${collectionId}/metafields.json`);
-          const existingLogoMf = existingMfs.metafields?.find(mf => mf.key === 'vendor_logo' && mf.namespace === 'custom');
-          if (existingLogoMf) {
-            await shopifyFetch(`/metafields/${existingLogoMf.id}.json`, {
-              method: 'PUT',
-              body: JSON.stringify({ metafield: { id: existingLogoMf.id, value: uploadedImageUrl } })
-            });
-          } else {
-            await shopifyFetch(`/collections/${collectionId}/metafields.json`, {
-              method: 'POST',
-              body: JSON.stringify({
-                metafield: { namespace: 'custom', key: 'vendor_logo', value: uploadedImageUrl, type: 'single_line_text_field' }
-              })
-            });
-          }
-          console.log(`Uploaded email logo and persisted to vendor_logo metafield for vendor: ${req.params.handle}`);
-        } catch (mfErr) {
-          console.error('Warning: could not persist email_logo to metafield:', mfErr.message);
-        }
+      // For email-builder image types (email_logo, email_block_*), skip metafield
+      // storage — we only need the CDN URL for email delivery.
+      if (imageType === 'email_logo' || imageType.startsWith('email_block_')) {
+        console.log(`✅ Uploaded email image (${imageType}) for vendor: ${req.params.handle}`);
         return res.json({ success: true, imageType, url: uploadedImageUrl });
       }
 
@@ -1449,51 +1492,31 @@ app.delete('/api/vendors/:handle/settings/images/:imageType',
 );
 
 // =============================================================================
-// ROUTES: EMAIL CAMPAIGNS (OMNISEND)
+// ROUTES: EMAIL CAMPAIGNS (AMAZON SES + AZURE SQL)
 // =============================================================================
 
 /**
  * GET /api/vendors/:handle/subscribers/count
- * Returns the number of subscribed contacts tagged with this vendor's handle.
- * Used by the email builder to show "X subscribers will receive this."
- *
- * Requires env: OMNISEND_API_KEY
+ * Returns subscriber count from Azure SQL for a given audience segment.
+ * Query param: ?audience=all|newsletter|sms_opted_in|recent_buyers
  */
 app.get('/api/vendors/:handle/subscribers/count',
   requireShopifyAuth,
   requireVendorAuth,
   async (req, res) => {
     const { handle } = req.params;
-    const tag = getVendorTag(handle);
-    const apiKey = process.env.OMNISEND_API_KEY;
-
-    if (!apiKey) {
-      return res.json({ count: 0, note: 'OMNISEND_API_KEY not configured' });
-    }
-
+    const audience   = req.query.audience || 'all';
     try {
-      const url = `https://api.omnisend.com/v3/contacts?tags=${encodeURIComponent(tag)}&status=subscribed&limit=1`;
-
-      const response = await fetch(url, {
-        headers: {
-          'X-API-KEY': apiKey,
-          'Content-Type': 'application/json',
-        },
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        console.error('[Omnisend] subscriber count error:', errText);
-        return res.json({ count: 0 });
-      }
-
-      const data = await response.json();
-      const count = data.paging?.totalCount ?? (data.contacts?.length ?? 0);
-
-      console.log(`[Omnisend] ${handle} subscriber count: ${count}`);
+      const pool  = await getPool();
+      const where = buildAudienceQuery(handle, audience);
+      const result = await pool.request()
+        .input('vendorHandle', sql.NVarChar, handle)
+        .query(`SELECT COUNT(*) AS cnt ${where}`);
+      const count = result.recordset[0].cnt;
+      console.log(`[SQL] ${handle}/${audience} subscriber count: ${count}`);
       return res.json({ count });
     } catch (err) {
-      console.error('[Omnisend] subscriber count fetch failed:', err.message);
+      console.error('[SQL] subscriber count error:', err.message);
       return res.json({ count: 0 });
     }
   }
@@ -1501,137 +1524,119 @@ app.get('/api/vendors/:handle/subscribers/count',
 
 /**
  * POST /api/vendors/:handle/email/send
- * Creates and schedules an email campaign via Omnisend.
- * Targets contacts tagged with the vendor's handle.
+ * Sends an email campaign via Amazon SES to all contacts in the chosen
+ * audience segment fetched from Azure SQL. Suppression-safe, one message
+ * per recipient, HMAC-signed unsubscribe links, fully logged.
  *
  * Body:
  *   subject      {string}  Subject line (required)
  *   previewText  {string}  Inbox preview snippet
  *   htmlContent  {string}  Full rendered HTML from the email builder
- *
- * Requires env: OMNISEND_API_KEY, OMNISEND_FROM_EMAIL
+ *   audience     {string}  all|newsletter|sms_opted_in|recent_buyers
  */
 app.post('/api/vendors/:handle/email/send',
   requireShopifyAuth,
   requireVendorAuth,
   async (req, res) => {
-    const { handle } = req.params;
-    const { subject, previewText, htmlContent } = req.body;
-    const tag = getVendorTag(handle);
-    const apiKey = process.env.OMNISEND_API_KEY;
-
-    // ── Validation ────────────────────────────────────────────
-    if (!subject || !subject.trim()) {
-      return res.status(400).json({ error: 'Subject line is required.' });
-    }
-    if (!htmlContent || htmlContent.length < 100) {
-      return res.status(400).json({ error: 'Email content is missing or too short.' });
-    }
-    if (!apiKey) {
-      return res.status(500).json({
-        error: 'OMNISEND_API_KEY is not configured. Add it to your Render environment variables.',
-      });
-    }
-
-    // ── Sender identity ───────────────────────────────────────
+    const { handle }  = req.params;
+    const { subject, previewText, htmlContent, audience = 'all' } = req.body;
     const vendorDisplayName = VENDOR_MAP[handle] || handle;
+    const fromEmail = process.env.SES_FROM_EMAIL || 'hello@halfcourse.com';
     const fromName  = `${vendorDisplayName} @ HalfCourse`;
-    const fromEmail = process.env.OMNISEND_FROM_EMAIL || 'hello@halfcourse.com';
+    const appUrl    = process.env.APP_URL || 'https://halfcourse.com';
+
+    // ── Validation ────────────────────────────────────────────────────────
+    if (!subject?.trim())
+      return res.status(400).json({ error: 'Subject line is required.' });
+    if (!htmlContent || htmlContent.length < 100)
+      return res.status(400).json({ error: 'Email content is missing or too short.' });
 
     try {
-      // ── Step 1: Create campaign ───────────────────────────────
-      const campaignPayload = {
-        name: `${vendorDisplayName} — ${subject.substring(0, 50)} (${new Date().toLocaleDateString('en-US')})`,
-        type: 'regular',
-        options: {
-          trackLinks: true,
-        },
-        sendingSettings: {
-          contactsFilter: {
-            tags: [tag],
-            status: 'subscribed',
-          },
-          fromName:     fromName,
-          fromEmail:    fromEmail,
-          replyToEmail: process.env.OMNISEND_REPLY_EMAIL || fromEmail,
-        },
-        content: {
-          subject:          subject.trim(),
-          preheader:        previewText ? previewText.trim() : '',
-          htmlContent:      htmlContent,
-          plainTextContent: stripHtmlToText(htmlContent),
-        },
-      };
+      // ── 1. Fetch recipient list from Azure SQL ─────────────────────────
+      const pool  = await getPool();
+      const where = buildAudienceQuery(handle, audience);
+      const result = await pool.request()
+        .input('vendorHandle', sql.NVarChar, handle)
+        .query(`SELECT c.id, c.email, c.first_name ${where}`);
 
-      const createRes = await fetch('https://api.omnisend.com/v3/campaigns', {
-        method: 'POST',
-        headers: {
-          'X-API-KEY': apiKey,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(campaignPayload),
-      });
-
-      const createText = await createRes.text();
-      let createData;
-      try { createData = JSON.parse(createText); } catch (_) { createData = {}; }
-
-      if (!createRes.ok) {
-        console.error('[Omnisend] create campaign failed:', createText);
-        const omniError = createData?.error?.message
-          || createData?.message
-          || `Omnisend returned status ${createRes.status}`;
-        return res.status(502).json({ error: 'Campaign creation failed: ' + omniError });
+      const recipients = result.recordset;
+      if (recipients.length === 0) {
+        return res.status(400).json({ error: 'No eligible subscribers found for this audience.' });
       }
 
-      const campaignId = createData.campaignID || createData.id;
-      if (!campaignId) {
-        console.error('[Omnisend] no campaignID in response:', createData);
-        return res.status(502).json({ error: 'Omnisend did not return a campaign ID.' });
-      }
+      console.log(`[SES] Sending "${subject}" to ${recipients.length} recipients for ${handle}/${audience}`);
 
-      console.log(`[Email] Campaign created: ${campaignId} for vendor ${handle}`);
+      // ── 2. Send one SES message per recipient ──────────────────────────
+      const campaignId = `${handle}-${Date.now()}`;
+      let sent = 0, failed = 0;
 
-      // ── Step 2: Schedule for immediate send ───────────────────
-      // scheduledFor set 60 seconds ahead to give Omnisend time to process
-      const sendAt = new Date(Date.now() + 60000).toISOString();
+      for (const contact of recipients) {
+        try {
+          const token      = signUnsubscribeToken(contact.email);
+          const unsubUrl   = `${appUrl}/api/unsubscribe?token=${token}&vendor=${encodeURIComponent(handle)}`;
+          const listUnsub  = `<${unsubUrl}>, <mailto:unsubscribe@halfcourse.com?subject=unsubscribe>`;
 
-      const scheduleRes = await fetch(
-        `https://api.omnisend.com/v3/campaigns/${campaignId}/actions/start`,
-        {
-          method: 'POST',
-          headers: {
-            'X-API-KEY': apiKey,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ scheduledFor: sendAt }),
+          // Personalise HTML — inject first name if present, inject unsubscribe link
+          const personalised = htmlContent
+            .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
+            .replace(/UNSUBSCRIBE_LINK/g, unsubUrl);
+
+          const plainText = stripHtmlToText(personalised)
+            + `\n\nTo unsubscribe: ${unsubUrl}`;
+
+          await ses.send(new SendEmailCommand({
+            Source: `${fromName} <${fromEmail}>`,
+            Destination: { ToAddresses: [contact.email] },
+            Message: {
+              Subject: { Data: subject.trim() },
+              Body: {
+                Html: { Data: personalised },
+                Text: { Data: plainText },
+              },
+            },
+            ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,
+            Headers: [
+              { Name: 'List-Unsubscribe',      Value: listUnsub },
+              { Name: 'List-Unsubscribe-Post',  Value: 'List-Unsubscribe=One-Click' },
+              { Name: 'X-Campaign-ID',          Value: campaignId },
+              { Name: 'X-Vendor-Handle',        Value: handle },
+            ],
+          }));
+          sent++;
+        } catch (sendErr) {
+          console.error(`[SES] failed to send to ${contact.email}:`, sendErr.message);
+          failed++;
         }
-      );
-
-      const scheduleText = await scheduleRes.text();
-      let scheduleData;
-      try { scheduleData = JSON.parse(scheduleText); } catch (_) { scheduleData = {}; }
-
-      if (!scheduleRes.ok) {
-        console.error('[Omnisend] schedule campaign failed:', scheduleText);
-        const omniError = scheduleData?.error?.message
-          || scheduleData?.message
-          || `Status ${scheduleRes.status}`;
-        // Campaign created but not scheduled — return partial info
-        return res.status(502).json({
-          error: 'Campaign was created but could not be scheduled: ' + omniError,
-          campaignId,
-          hint: 'You can manually start it from your Omnisend dashboard.',
-        });
       }
 
-      console.log(`[Email] Campaign scheduled: ${campaignId} at ${sendAt}`);
+      // ── 3. Log campaign to Azure SQL ───────────────────────────────────
+      try {
+        await pool.request()
+          .input('campaign_id',    sql.NVarChar,  campaignId)
+          .input('vendor_handle',  sql.NVarChar,  handle)
+          .input('audience',       sql.NVarChar,  audience)
+          .input('subject',        sql.NVarChar,  subject.trim())
+          .input('sent_count',     sql.Int,       sent)
+          .input('failed_count',   sql.Int,       failed)
+          .input('sent_at',        sql.DateTime2, new Date())
+          .query(`
+            INSERT INTO email_send_log
+              (campaign_id, vendor_handle, audience, subject, sent_count, failed_count, sent_at)
+            VALUES
+              (@campaign_id, @vendor_handle, @audience, @subject, @sent_count, @failed_count, @sent_at)
+          `);
+      } catch (logErr) {
+        console.error('[SQL] campaign log error:', logErr.message);
+        // Non-fatal — don't fail the response over a logging issue
+      }
 
+      console.log(`[SES] Campaign ${campaignId} complete: ${sent} sent, ${failed} failed`);
       return res.json({
         success: true,
         campaignId,
-        scheduledFor: sendAt,
-        message: 'Campaign created and scheduled successfully.',
+        sent,
+        failed,
+        message: `Campaign sent to ${sent} subscriber${sent !== 1 ? 's' : ''}${failed ? \` (${failed} failed)\` : ''}.`,
       });
 
     } catch (err) {
@@ -1641,40 +1646,180 @@ app.post('/api/vendors/:handle/email/send',
   }
 );
 
-
 // =============================================================================
-// AMAZON SES FOR TESTING
+// AMAZON SES — TEST SEND
 // =============================================================================
 
-app.post("/api/vendors/:vendor/email/test", async (req, res) => {
-  try {
-    const { to, subject, htmlContent } = req.body;
+/**
+ * POST /api/vendors/:vendor/email/test
+ * Sends a single test email via SES. Requires vendor auth.
+ */
+app.post("/api/vendors/:vendor/email/test",
+  requireShopifyAuth,
+  requireVendorAuth,
+  async (req, res) => {
+    try {
+      const { to, subject, htmlContent } = req.body;
+      const handle = req.params.vendor;
+      const vendorDisplayName = VENDOR_MAP[handle] || handle;
+      const fromEmail = process.env.SES_FROM_EMAIL || "hello@halfcourse.com";
 
-    if (!to || !subject || !htmlContent) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    const params = {
-      Source: process.env.SES_FROM_EMAIL,
-      Destination: {
-        ToAddresses: [to],
-      },
-      Message: {
-        Subject: { Data: subject },
-        Body: {
-          Html: { Data: htmlContent },
-          Text: { Data: "View this email in an HTML-compatible client." }
-        }
+      if (!to || !subject || !htmlContent) {
+        return res.status(400).json({ error: "Missing required fields" });
       }
-    };
 
-    await ses.send(new SendEmailCommand(params));
+      await ses.send(new SendEmailCommand({
+        Source: `${vendorDisplayName} @ HalfCourse <${fromEmail}>`,
+        Destination: { ToAddresses: [to] },
+        Message: {
+          Subject: { Data: subject },
+          Body: {
+            Html: { Data: htmlContent },
+            Text: { Data: stripHtmlToText(htmlContent) },
+          },
+        },
+        ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,
+      }));
 
-    return res.json({ success: true });
+      console.log(`[SES] Test email sent to ${to} for vendor ${handle}`);
+      return res.json({ success: true });
 
+    } catch (err) {
+      console.error("SES test send error:", err);
+      return res.status(500).json({ error: "Test send failed: " + err.message });
+    }
+  }
+);
+
+// =============================================================================
+// UNSUBSCRIBE ENDPOINT
+// =============================================================================
+
+/**
+ * GET /api/unsubscribe?token=...&vendor=...
+ * One-click unsubscribe. Validates HMAC, inserts into suppressions.
+ */
+app.get("/api/unsubscribe", async (req, res) => {
+  const { token, vendor } = req.query;
+  const email = verifyUnsubscribeToken(token);
+  if (!email) return res.status(400).send("Invalid or expired unsubscribe link.");
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input("email",        sql.NVarChar, email)
+      .input("vendorHandle", sql.NVarChar, vendor || null)
+      .input("reason",       sql.NVarChar, "unsubscribe")
+      .query(`
+        IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email AND (vendor_handle = @vendorHandle OR vendor_handle IS NULL))
+          INSERT INTO suppressions (email, vendor_handle, reason, created_at)
+          VALUES (@email, @vendorHandle, @reason, GETUTCDATE())
+      `);
+    await pool.request()
+      .input("email",        sql.NVarChar, email)
+      .input("vendorHandle", sql.NVarChar, vendor || null)
+      .query(`
+        UPDATE vendor_subscriptions
+        SET status = 'unsubscribed', unsubscribed_at = GETUTCDATE()
+        WHERE contact_id = (SELECT id FROM contacts WHERE email = @email)
+          AND (@vendorHandle IS NULL OR vendor_handle = @vendorHandle)
+      `);
+    console.log(`[Unsubscribe] ${email} unsubscribed from ${vendor || "all"}`);
+    res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;">
+      <h2>You have been unsubscribed.</h2>
+      <p>You will no longer receive emails from ${vendor ? vendor + " via " : ""}HalfCourse.</p>
+    </body></html>`);
   } catch (err) {
-    console.error("SES test send error:", err);
-    return res.status(500).json({ error: "Test send failed" });
+    console.error("[Unsubscribe] error:", err.message);
+    res.status(500).send("Something went wrong. Please try again.");
+  }
+});
+
+/** POST /api/unsubscribe — RFC 8058 one-click unsubscribe for email clients */
+app.post("/api/unsubscribe", express.urlencoded({ extended: false }), async (req, res) => {
+  const token  = req.query.token  || req.body.token;
+  const vendor = req.query.vendor || req.body.vendor;
+  const email  = verifyUnsubscribeToken(token);
+  if (!email) return res.status(400).json({ error: "Invalid token" });
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input("email",        sql.NVarChar, email)
+      .input("vendorHandle", sql.NVarChar, vendor || null)
+      .input("reason",       sql.NVarChar, "unsubscribe")
+      .query(`
+        IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email AND (vendor_handle = @vendorHandle OR vendor_handle IS NULL))
+          INSERT INTO suppressions (email, vendor_handle, reason, created_at)
+          VALUES (@email, @vendorHandle, @reason, GETUTCDATE())
+      `);
+    await pool.request()
+      .input("email",        sql.NVarChar, email)
+      .input("vendorHandle", sql.NVarChar, vendor || null)
+      .query(`
+        UPDATE vendor_subscriptions SET status = 'unsubscribed', unsubscribed_at = GETUTCDATE()
+        WHERE contact_id = (SELECT id FROM contacts WHERE email = @email)
+          AND (@vendorHandle IS NULL OR vendor_handle = @vendorHandle)
+      `);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Unsubscribe POST] error:", err.message);
+    res.status(500).json({ error: "Unsubscribe failed" });
+  }
+});
+
+// =============================================================================
+// SNS WEBHOOK — BOUNCE & COMPLAINT SUPPRESSION
+// =============================================================================
+
+/**
+ * POST /api/sns/bounce
+ * Receives SES bounce/complaint notifications via AWS SNS.
+ * Hard bounces and complaints are suppressed in Azure SQL.
+ * Set this as your SES Configuration Set SNS destination.
+ */
+app.post("/api/sns/bounce", express.json({ type: "*/*" }), async (req, res) => {
+  try {
+    let body = req.body;
+    if (typeof body.Message === "string") {
+      try { body = { ...body, Message: JSON.parse(body.Message) }; } catch (_) {}
+    }
+    if (body.Type === "SubscriptionConfirmation" && body.SubscribeURL) {
+      await fetch(body.SubscribeURL);
+      console.log("[SNS] Subscription confirmed");
+      return res.sendStatus(200);
+    }
+    const msg = body.Message || body;
+    const notifType = msg.notificationType;
+    const pool = await getPool();
+
+    if (notifType === "Bounce" && msg.bounce?.bounceType === "Permanent") {
+      for (const r of msg.bounce.bouncedRecipients || []) {
+        await pool.request()
+          .input("email",  sql.NVarChar, r.emailAddress)
+          .input("reason", sql.NVarChar, "hard_bounce")
+          .query(`
+            IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email)
+              INSERT INTO suppressions (email, vendor_handle, reason, created_at)
+              VALUES (@email, NULL, @reason, GETUTCDATE())
+          `);
+        console.log(`[SNS] Hard bounce suppressed: ${r.emailAddress}`);
+      }
+    } else if (notifType === "Complaint") {
+      for (const r of msg.complaint?.complainedRecipients || []) {
+        await pool.request()
+          .input("email",  sql.NVarChar, r.emailAddress)
+          .input("reason", sql.NVarChar, "complaint")
+          .query(`
+            IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email)
+              INSERT INTO suppressions (email, vendor_handle, reason, created_at)
+              VALUES (@email, NULL, @reason, GETUTCDATE())
+          `);
+        console.log(`[SNS] Complaint suppressed: ${r.emailAddress}`);
+      }
+    }
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("[SNS] webhook error:", err.message);
+    res.sendStatus(500);
   }
 });
 
@@ -1711,7 +1856,10 @@ app.listen(PORT, () => {
   console.log(`App URL: ${APP_URL}`);
   console.log(`Store: ${SHOPIFY_STORE}`);
   console.log(`Shopify Connected: ${!!shopifyAccessTokens[SHOPIFY_STORE]}`);
-  console.log(`Omnisend Configured: ${!!process.env.OMNISEND_API_KEY}`);
+  console.log(`SES Region:        ${process.env.AWS_REGION || '(not set)'}`);
+  console.log(`SES From Email:    ${process.env.SES_FROM_EMAIL || '(not set)'}`);
+  console.log(`Azure SQL Server:  ${process.env.SQL_SERVER || '(not set)'}`);
+  console.log(`Azure SQL DB:      ${process.env.SQL_DATABASE || '(not set)'}`);
   console.log(`Configured vendors: ${Object.keys(VENDOR_MAP).join(', ')}`);
   console.log('');
 });
