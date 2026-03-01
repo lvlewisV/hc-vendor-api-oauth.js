@@ -13,8 +13,27 @@
  * - Subscriber counts from Azure SQL
  * - SQL-driven audience segments
  * - HMAC-signed one-click unsubscribe (Gmail/Yahoo compliant)
- * - SNS webhook for bounce/complaint suppression
+ * - SNS webhook for bounce/complaint/delivery/open/click suppression & tracking
  * - Campaign logging to email_send_log
+ * - Per-recipient SES MessageId logging to email_send_recipients
+ *
+ * Azure SQL DDL required for per-recipient tracking:
+ *
+ *   CREATE TABLE email_send_recipients (
+ *     id              INT IDENTITY(1,1) PRIMARY KEY,
+ *     campaign_id     NVARCHAR(100)  NOT NULL,
+ *     contact_id      INT            NOT NULL,
+ *     email           NVARCHAR(254)  NOT NULL,
+ *     ses_message_id  NVARCHAR(200)  NULL,
+ *     status          NVARCHAR(50)   NOT NULL DEFAULT 'sent',
+ *     sent_at         DATETIME2      NOT NULL DEFAULT GETUTCDATE(),
+ *     event_at        DATETIME2      NULL,
+ *     INDEX IX_campaign   (campaign_id),
+ *     INDEX IX_message_id (ses_message_id),
+ *     INDEX IX_email      (email)
+ *   );
+ *
+ * status values: sent | delivered | opened | clicked | bounced | complained
  *
  * Deploy to: Render.com
  * Repository: github.com/lvlewisV/hc-vendor-api-oauth.js
@@ -449,6 +468,27 @@ function stripHtmlToText(html) {
     .replace(/&nbsp;/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * Update a recipient row status in email_send_recipients by SES MessageId.
+ * Non-fatal — logs errors but does not throw.
+ */
+async function updateRecipientStatus(pool, sesMessageId, status) {
+  if (!sesMessageId) return;
+  try {
+    await pool.request()
+      .input('ses_message_id', sql.NVarChar, sesMessageId)
+      .input('status',         sql.NVarChar, status)
+      .input('event_at',       sql.DateTime2, new Date())
+      .query(`
+        UPDATE email_send_recipients
+        SET status = @status, event_at = @event_at
+        WHERE ses_message_id = @ses_message_id
+      `);
+  } catch (err) {
+    console.error(`[SQL] updateRecipientStatus (${status}) error:`, err.message);
+  }
 }
 
 // =============================================================================
@@ -1584,7 +1624,8 @@ app.post('/api/vendors/:handle/email/send',
           const plainText = stripHtmlToText(personalised)
             + `\n\nTo unsubscribe: ${unsubUrl}`;
 
-          await ses.send(new SendEmailCommand({
+          // ── Send and capture the SES MessageId ────────────────────────
+          const sesResponse = await ses.send(new SendEmailCommand({
             Source: `${fromName} <${fromEmail}>`,
             Destination: { ToAddresses: [contact.email] },
             Message: {
@@ -1602,6 +1643,25 @@ app.post('/api/vendors/:handle/email/send',
               { Name: 'X-Vendor-Handle',        Value: handle },
             ],
           }));
+
+          const sesMessageId = sesResponse.MessageId;
+
+          // ── Write per-recipient row with MessageId ─────────────────────
+          await pool.request()
+            .input('campaign_id',    sql.NVarChar,  campaignId)
+            .input('contact_id',     sql.Int,        contact.id)
+            .input('email',          sql.NVarChar,  contact.email)
+            .input('ses_message_id', sql.NVarChar,  sesMessageId)
+            .input('status',         sql.NVarChar,  'sent')
+            .input('sent_at',        sql.DateTime2, new Date())
+            .query(`
+              INSERT INTO email_send_recipients
+                (campaign_id, contact_id, email, ses_message_id, status, sent_at)
+              VALUES
+                (@campaign_id, @contact_id, @email, @ses_message_id, @status, @sent_at)
+            `);
+
+          console.log(`[SES] Sent to ${contact.email} — MessageId: ${sesMessageId}`);
           sent++;
         } catch (sendErr) {
           console.error(`[SES] failed to send to ${contact.email}:`, sendErr.message);
@@ -1668,7 +1728,7 @@ app.post("/api/vendors/:vendor/email/test",
         return res.status(400).json({ error: "Missing required fields" });
       }
 
-      await ses.send(new SendEmailCommand({
+      const sesResponse = await ses.send(new SendEmailCommand({
         Source: `${vendorDisplayName} @ HalfCourse <${fromEmail}>`,
         Destination: { ToAddresses: [to] },
         Message: {
@@ -1681,9 +1741,8 @@ app.post("/api/vendors/:vendor/email/test",
         ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,
       }));
 
-      console.log(`[SES] Test email sent to ${to} for vendor ${handle}`);
-      return res.json({ success: true });
-
+      console.log(`[SES] Test email sent to ${to} for vendor ${handle} — MessageId: ${sesResponse.MessageId}`);
+      return res.json({ success: true, messageId: sesResponse.MessageId });
     } catch (err) {
       console.error("SES test send error:", err);
       return res.status(500).json({ error: "Test send failed: " + err.message });
@@ -1767,43 +1826,78 @@ app.post("/api/unsubscribe", express.urlencoded({ extended: false }), async (req
 });
 
 // =============================================================================
-// SNS WEBHOOK — BOUNCE & COMPLAINT SUPPRESSION
+// SNS WEBHOOK — BOUNCE, COMPLAINT, DELIVERY, OPEN, CLICK
 // =============================================================================
 
 /**
  * POST /api/sns/bounce
- * Receives SES bounce/complaint notifications via AWS SNS.
- * Hard bounces and complaints are suppressed in Azure SQL.
- * Set this as your SES Configuration Set SNS destination.
+ *
+ * Receives SES event notifications via AWS SNS for the configured
+ * Configuration Set. Handles:
+ *
+ *   Bounce (Permanent)  → suppresses email + sets recipient status = 'bounced'
+ *   Bounce (Transient)  → logs only, does not suppress
+ *   Complaint           → suppresses email + sets recipient status = 'complained'
+ *   Delivery            → sets recipient status = 'delivered'
+ *   Open                → sets recipient status = 'opened'
+ *   Click               → sets recipient status = 'clicked'
+ *
+ * MessageId reconciliation: every event includes mail.messageId, which is
+ * matched against email_send_recipients.ses_message_id to identify the exact
+ * recipient row. This is the core of per-recipient deliverability tracking.
+ *
+ * Setup: In your SES Configuration Set, add an SNS destination for each
+ * event type (Bounce, Complaint, Delivery, Open, Click) pointing at:
+ *   POST https://<your-render-url>/api/sns/bounce
  */
 app.post("/api/sns/bounce", express.json({ type: "*/*" }), async (req, res) => {
   try {
     let body = req.body;
+
+    // SNS wraps the SES notification as a JSON string inside body.Message
     if (typeof body.Message === "string") {
       try { body = { ...body, Message: JSON.parse(body.Message) }; } catch (_) {}
     }
+
+    // ── SNS subscription confirmation (one-time handshake) ──────────────────
     if (body.Type === "SubscriptionConfirmation" && body.SubscribeURL) {
       await fetch(body.SubscribeURL);
       console.log("[SNS] Subscription confirmed");
       return res.sendStatus(200);
     }
-    const msg = body.Message || body;
-    const notifType = msg.notificationType;
-    const pool = await getPool();
 
-    if (notifType === "Bounce" && msg.bounce?.bounceType === "Permanent") {
-      for (const r of msg.bounce.bouncedRecipients || []) {
-        await pool.request()
-          .input("email",  sql.NVarChar, r.emailAddress)
-          .input("reason", sql.NVarChar, "hard_bounce")
-          .query(`
-            IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email)
-              INSERT INTO suppressions (email, vendor_handle, reason, created_at)
-              VALUES (@email, NULL, @reason, GETUTCDATE())
-          `);
-        console.log(`[SNS] Hard bounce suppressed: ${r.emailAddress}`);
+    const msg       = body.Message || body;
+    const notifType = msg.notificationType;
+    const messageId = msg.mail?.messageId || null;
+    const pool      = await getPool();
+
+    // ── Bounce ───────────────────────────────────────────────────────────────
+    if (notifType === "Bounce") {
+      const bounceType = msg.bounce?.bounceType;
+
+      for (const r of msg.bounce?.bouncedRecipients || []) {
+        if (bounceType === "Permanent") {
+          // Hard bounce — suppress permanently
+          await pool.request()
+            .input("email",  sql.NVarChar, r.emailAddress)
+            .input("reason", sql.NVarChar, "hard_bounce")
+            .query(`
+              IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email)
+                INSERT INTO suppressions (email, vendor_handle, reason, created_at)
+                VALUES (@email, NULL, @reason, GETUTCDATE())
+            `);
+          console.log(`[SNS] Hard bounce suppressed: ${r.emailAddress}`);
+        } else {
+          // Soft bounce — log only, do not suppress
+          console.log(`[SNS] Soft bounce (${msg.bounce?.bounceSubType}) for: ${r.emailAddress}`);
+        }
       }
-    } else if (notifType === "Complaint") {
+
+      await updateRecipientStatus(pool, messageId, "bounced");
+    }
+
+    // ── Complaint ────────────────────────────────────────────────────────────
+    else if (notifType === "Complaint") {
       for (const r of msg.complaint?.complainedRecipients || []) {
         await pool.request()
           .input("email",  sql.NVarChar, r.emailAddress)
@@ -1815,7 +1909,32 @@ app.post("/api/sns/bounce", express.json({ type: "*/*" }), async (req, res) => {
           `);
         console.log(`[SNS] Complaint suppressed: ${r.emailAddress}`);
       }
+
+      await updateRecipientStatus(pool, messageId, "complained");
     }
+
+    // ── Delivery ─────────────────────────────────────────────────────────────
+    else if (notifType === "Delivery") {
+      await updateRecipientStatus(pool, messageId, "delivered");
+      console.log(`[SNS] Delivered — MessageId: ${messageId}`);
+    }
+
+    // ── Open ─────────────────────────────────────────────────────────────────
+    else if (notifType === "Open") {
+      await updateRecipientStatus(pool, messageId, "opened");
+      console.log(`[SNS] Opened — MessageId: ${messageId}`);
+    }
+
+    // ── Click ────────────────────────────────────────────────────────────────
+    else if (notifType === "Click") {
+      await updateRecipientStatus(pool, messageId, "clicked");
+      console.log(`[SNS] Clicked — MessageId: ${messageId}, URL: ${msg.click?.link}`);
+    }
+
+    else {
+      console.log(`[SNS] Unhandled event type: ${notifType}`);
+    }
+
     res.sendStatus(200);
   } catch (err) {
     console.error("[SNS] webhook error:", err.message);
@@ -1858,6 +1977,7 @@ app.listen(PORT, () => {
   console.log(`Shopify Connected: ${!!shopifyAccessTokens[SHOPIFY_STORE]}`);
   console.log(`SES Region:        ${process.env.AWS_REGION || '(not set)'}`);
   console.log(`SES From Email:    ${process.env.SES_FROM_EMAIL || '(not set)'}`);
+  console.log(`SES Config Set:    ${process.env.SES_CONFIG_SET || '(not set)'}`);
   console.log(`Azure SQL Server:  ${process.env.SQL_SERVER || '(not set)'}`);
   console.log(`Azure SQL DB:      ${process.env.SQL_DATABASE || '(not set)'}`);
   console.log(`Configured vendors: ${Object.keys(VENDOR_MAP).join(', ')}`);
