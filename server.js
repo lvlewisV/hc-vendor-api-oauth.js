@@ -423,28 +423,51 @@ function verifyUnsubscribeToken(token) {
 
 /**
  * Build the SQL WHERE clause for an audience segment.
- * Segment values must match the options in the frontend dropdown.
+ * Legacy fallback — no longer used directly.
+ * Audience filters are now driven dynamically from email_segments table.
  */
-function buildAudienceQuery(vendorHandle, audience) {
+function buildAudienceQuery() {
+  // Legacy fallback — no longer used directly.
+  // Audience filters are now driven dynamically from email_segments table.
+  return `
+    FROM contacts c
+    JOIN vendor_subscriptions vs ON vs.contact_id = c.id
+    WHERE 1 = 0
+  `;
+}
+
+/**
+ * Fetch SQL filter for a vendor segment from email_segments table.
+ */
+async function getSegmentWhereClause(pool, vendorHandle, audienceKey) {
   const base = `
     FROM contacts c
     JOIN vendor_subscriptions vs ON vs.contact_id = c.id
     WHERE vs.vendor_handle = @vendorHandle
       AND vs.status = 'subscribed'
       AND c.email IS NOT NULL
-      AND c.email NOT IN (SELECT email FROM suppressions WHERE vendor_handle = @vendorHandle OR vendor_handle IS NULL)
+            AND c.email NOT IN (
+        SELECT email FROM suppressions
+        WHERE vendor_handle = @vendorHandle OR vendor_handle IS NULL
+      )
   `;
-  switch (audience) {
-    case 'newsletter':
-      return base + ` AND vs.source = 'newsletter'`;
-    case 'sms_opted_in':
-      return base + ` AND c.sms_status = 'subscribed'`;
-    case 'recent_buyers':
-      return base + ` AND c.last_order_at >= DATEADD(day, -30, GETUTCDATE())`;
-    case 'all':
-    default:
-      return base;
+
+  const seg = await pool.request()
+    .input('vendorHandle', sql.NVarChar, vendorHandle)
+    .input('key', sql.NVarChar, audienceKey)
+    .query(`
+      SELECT sql_filter
+      FROM email_segments
+      WHERE vendor_handle = @vendorHandle
+        AND key_name = @key
+    `);
+
+  if (!seg.recordset.length) {
+    return base; // fallback to base query
   }
+  
+  const filter = seg.recordset[0].sql_filter;
+  return base + (filter ? ` AND (${filter})` : '');
 }
 
 /**
@@ -1536,6 +1559,35 @@ app.delete('/api/vendors/:handle/settings/images/:imageType',
 // =============================================================================
 
 /**
+ * GET /api/vendors/:handle/email/segments
+ * Returns available SQL-driven segments for dashboard dropdown.
+ */
+app.get('/api/vendors/:handle/email/segments',
+  requireShopifyAuth,
+  requireVendorAuth,
+  async (req, res) => {
+    try {
+      const pool = await getPool();
+      const { handle } = req.params;
+
+      const result = await pool.request()
+        .input('vendorHandle', sql.NVarChar, handle)
+        .query(`
+          SELECT name, key_name
+          FROM email_segments
+          WHERE vendor_handle = @vendorHandle
+          ORDER BY name
+        `);
+
+      res.json({ segments: result.recordset });
+    } catch (err) {
+      console.error('[Segments] fetch error:', err.message);
+      res.status(500).json({ error: 'Failed to fetch segments' });
+    }
+  }
+);
+
+/**
  * GET /api/vendors/:handle/subscribers/count
  * Returns subscriber count from Azure SQL for a given audience segment.
  * Query param: ?audience=all|newsletter|sms_opted_in|recent_buyers
@@ -1548,7 +1600,7 @@ app.get('/api/vendors/:handle/subscribers/count',
     const audience   = req.query.audience || 'all';
     try {
       const pool  = await getPool();
-      const where = buildAudienceQuery(handle, audience);
+      const where = await getSegmentWhereClause(pool, handle, audience);
       const result = await pool.request()
         .input('vendorHandle', sql.NVarChar, handle)
         .query(`SELECT COUNT(*) AS cnt ${where}`);
@@ -1594,7 +1646,7 @@ app.post('/api/vendors/:handle/email/send',
     try {
       // ── 1. Fetch recipient list from Azure SQL ─────────────────────────
       const pool  = await getPool();
-      const where = buildAudienceQuery(handle, audience);
+      const where = await getSegmentWhereClause(pool, handle, audience);
       const result = await pool.request()
         .input('vendorHandle', sql.NVarChar, handle)
         .query(`SELECT c.id, c.email, c.first_name ${where}`);
