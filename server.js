@@ -56,7 +56,7 @@ async function getPool() {
     user:     process.env.SQL_USERNAME,
     password: process.env.SQL_PASSWORD,
     options:  { encrypt: true, trustServerCertificate: false },
-    pool:     { max: 10, min: 0, idleTimeoutMillis: 30000 },
+   pool: { max: 10, min: 0, idleTimeoutMillisMs: 30000 },
   });
   console.log("✅ Azure SQL pool connected");
   return sqlPool;
@@ -1687,7 +1687,7 @@ app.post('/api/vendors/:handle/email/send',
                 Text: { Data: plainText },
               },
             },
-            ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,,
+            ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,
           }));
 
           const sesMessageId = sesResponse.MessageId;
