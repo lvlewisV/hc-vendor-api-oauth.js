@@ -56,7 +56,7 @@ async function getPool() {
     user:     process.env.SQL_USERNAME,
     password: process.env.SQL_PASSWORD,
     options:  { encrypt: true, trustServerCertificate: false },
-    pool:     { max: 10, min: 0, idleTimeoutMillisMs: 30000 },
+    pool:     { max: 10, min: 0, idleTimeoutMillis: 30000 },
   });
   console.log("✅ Azure SQL pool connected");
   return sqlPool;
@@ -1687,13 +1687,7 @@ app.post('/api/vendors/:handle/email/send',
                 Text: { Data: plainText },
               },
             },
-            ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,
-            Headers: [
-              { Name: 'List-Unsubscribe',      Value: listUnsub },
-              { Name: 'List-Unsubscribe-Post',  Value: 'List-Unsubscribe=One-Click' },
-              { Name: 'X-Campaign-ID',          Value: campaignId },
-              { Name: 'X-Vendor-Handle',        Value: handle },
-            ],
+            ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,,
           }));
 
           const sesMessageId = sesResponse.MessageId;
@@ -1763,16 +1757,16 @@ app.post('/api/vendors/:handle/email/send',
 // =============================================================================
 
 /**
- * POST /api/vendors/:vendor/email/test
+ * POST /api/vendors/:handle/email/test
  * Sends a single test email via SES. Requires vendor auth.
  */
-app.post("/api/vendors/:vendor/email/test",
+app.post("/api/vendors/:handle/email/test",
   requireShopifyAuth,
   requireVendorAuth,
   async (req, res) => {
     try {
       const { to, subject, htmlContent } = req.body;
-      const handle = req.params.vendor;
+      const handle = req.params.handle;
       const vendorDisplayName = VENDOR_MAP[handle] || handle;
       const fromEmail = process.env.SES_FROM_EMAIL || "hello@halfcourse.com";
 
