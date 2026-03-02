@@ -1553,58 +1553,61 @@ app.post('/api/vendors/:vendor/subscribe', async (req, res) => {
   try {
     const pool = await getPool();
 
-    // 1. Upsert contact into contacts table
+    // 1. Upsert contact
     await pool.request()
-      .input('email',      sql.NVarChar, email.toLowerCase().trim())
-      .input('firstName',  sql.NVarChar, firstName || null)
-      .input('lastName',   sql.NVarChar, lastName  || null)
-      .input('phone',      sql.NVarChar, phone      || null)
-      .input('smsStatus',  sql.NVarChar, smsOptin ? 'subscribed' : 'not_subscribed')
+      .input('email',        sql.NVarChar, email.toLowerCase().trim())
+      .input('firstName',    sql.NVarChar, firstName  || null)
+      .input('lastName',     sql.NVarChar, lastName   || null)
+      .input('phone',        sql.NVarChar, phone      || null)
+      .input('smsStatus',    sql.NVarChar, smsOptin ? 'subscribed' : 'not_subscribed')
+      .input('vendorHandle', sql.NVarChar, vendorHandle)
       .query(`
         MERGE contacts AS target
-        USING (SELECT @email AS email) AS source ON target.email = source.email
+        USING (SELECT @email AS email) AS src ON target.email = src.email
         WHEN MATCHED THEN
           UPDATE SET
-            first_name  = COALESCE(@firstName, target.first_name),
-            last_name   = COALESCE(@lastName,  target.last_name),
-            phone       = COALESCE(@phone,     target.phone),
-            sms_status  = CASE WHEN @smsStatus = 'subscribed' THEN 'subscribed' ELSE target.sms_status END,
-            updated_at  = GETUTCDATE()
+            first_name    = COALESCE(@firstName, target.first_name),
+            last_name     = COALESCE(@lastName,  target.last_name),
+            phone         = COALESCE(@phone,     target.phone),
+            sms_status    = CASE WHEN @smsStatus = 'subscribed' THEN 'subscribed' ELSE target.sms_status END,
+            updated_at    = GETUTCDATE()
         WHEN NOT MATCHED THEN
-          INSERT (email, first_name, last_name, phone, sms_status, created_at, updated_at)
-          VALUES (@email, @firstName, @lastName, @phone, @smsStatus, GETUTCDATE(), GETUTCDATE());
+          INSERT (email, first_name, last_name, phone, sms_status, vendor_handle, global_status, created_at, updated_at)
+          VALUES (@email, @firstName, @lastName, @phone, @smsStatus, @vendorHandle, 'subscribed', GETUTCDATE(), GETUTCDATE());
       `);
 
-    // 2. Get the contact_id
+    // 2. Get contact_id
     const contactResult = await pool.request()
       .input('email', sql.NVarChar, email.toLowerCase().trim())
-      .query(`SELECT id FROM contacts WHERE email = @email`);
+      .query(`SELECT contact_id FROM contacts WHERE email = @email`);
 
-    const contactId = contactResult.recordset[0]?.id;
+    const contactId = contactResult.recordset[0]?.contact_id;
     if (!contactId) throw new Error('Contact not found after upsert.');
 
-    // 3. Upsert into vendor_subscriptions
+    // 3. Upsert vendor_subscriptions
     await pool.request()
-      .input('contactId',    sql.Int,      contactId)
-      .input('vendorHandle', sql.NVarChar, vendorHandle)
-      .input('source',       sql.NVarChar, source || 'form')
+      .input('contactId',   sql.BigInt,   contactId)
+      .input('vendorTag',   sql.NVarChar, vendorHandle)
+      .input('source',      sql.NVarChar, source || 'form')
       .query(`
         MERGE vendor_subscriptions AS target
-        USING (SELECT @contactId AS contact_id, @vendorHandle AS vendor_handle) AS src
-          ON target.contact_id = src.contact_id AND target.vendor_handle = src.vendor_handle
+        USING (SELECT @contactId AS contact_id, @vendorTag AS vendor_tag) AS src
+          ON target.contact_id = src.contact_id AND target.vendor_tag = src.vendor_tag
         WHEN MATCHED THEN
-          UPDATE SET status = 'subscribed', updated_at = GETUTCDATE()
+          UPDATE SET
+            vendor_status  = 'subscribed',
+            updated_at     = GETUTCDATE()
         WHEN NOT MATCHED THEN
-          INSERT (contact_id, vendor_handle, status, source, subscribed_at, updated_at)
-          VALUES (@contactId, @vendorHandle, 'subscribed', @source, GETUTCDATE(), GETUTCDATE());
+          INSERT (vendor_tag, contact_id, vendor_status, source, subscribed_at, created_at, updated_at)
+          VALUES (@vendorTag, @contactId, 'subscribed', @source, GETUTCDATE(), GETUTCDATE(), GETUTCDATE());
       `);
 
-    console.log(`[Subscribe] ${email} subscribed to vendor: ${vendorHandle}`);
-    return res.json({ success: true, message: 'Subscribed successfully!' });
+    console.log(`[Subscribe] ${email} → ${vendorHandle}`);
+    return res.json({ success: true });
 
   } catch (err) {
     console.error('[Subscribe] error:', err.message);
-    return res.status(500).json({ error: 'Subscription failed. Please try again.' });
+    return res.status(500).json({ error: 'Subscription failed: ' + err.message });
   }
 });
 
