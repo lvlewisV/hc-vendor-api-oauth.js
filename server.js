@@ -56,7 +56,7 @@ async function getPool() {
     user:     process.env.SQL_USERNAME,
     password: process.env.SQL_PASSWORD,
     options:  { encrypt: true, trustServerCertificate: false },
-   pool: { max: 10, min: 0, idleTimeoutMillis: 30000 },
+    pool:     { max: 10, min: 0, idleTimeoutMillisMs: 30000 },
   });
   console.log("✅ Azure SQL pool connected");
   return sqlPool;
@@ -423,51 +423,28 @@ function verifyUnsubscribeToken(token) {
 
 /**
  * Build the SQL WHERE clause for an audience segment.
- * Legacy fallback — no longer used directly.
- * Audience filters are now driven dynamically from email_segments table.
+ * Segment values must match the options in the frontend dropdown.
  */
-function buildAudienceQuery() {
-  // Legacy fallback — no longer used directly.
-  // Audience filters are now driven dynamically from email_segments table.
-  return `
-    FROM contacts c
-    JOIN vendor_subscriptions vs ON vs.contact_id = c.id
-    WHERE 1 = 0
-  `;
-}
-
-/**
- * Fetch SQL filter for a vendor segment from email_segments table.
- */
-async function getSegmentWhereClause(pool, vendorHandle, audienceKey) {
+function buildAudienceQuery(vendorHandle, audience) {
   const base = `
     FROM contacts c
     JOIN vendor_subscriptions vs ON vs.contact_id = c.id
     WHERE vs.vendor_handle = @vendorHandle
       AND vs.status = 'subscribed'
       AND c.email IS NOT NULL
-            AND c.email NOT IN (
-        SELECT email FROM suppressions
-        WHERE vendor_handle = @vendorHandle OR vendor_handle IS NULL
-      )
+      AND c.email NOT IN (SELECT email FROM suppressions WHERE vendor_handle = @vendorHandle OR vendor_handle IS NULL)
   `;
-
-  const seg = await pool.request()
-    .input('vendorHandle', sql.NVarChar, vendorHandle)
-    .input('key', sql.NVarChar, audienceKey)
-    .query(`
-      SELECT sql_filter
-      FROM email_segments
-      WHERE vendor_handle = @vendorHandle
-        AND key_name = @key
-    `);
-
-  if (!seg.recordset.length) {
-    return base; // fallback to base query
+  switch (audience) {
+    case 'newsletter':
+      return base + ` AND vs.source = 'newsletter'`;
+    case 'sms_opted_in':
+      return base + ` AND c.sms_status = 'subscribed'`;
+    case 'recent_buyers':
+      return base + ` AND c.last_order_at >= DATEADD(day, -30, GETUTCDATE())`;
+    case 'all':
+    default:
+      return base;
   }
-  
-  const filter = seg.recordset[0].sql_filter;
-  return base + (filter ? ` AND (${filter})` : '');
 }
 
 /**
@@ -1559,35 +1536,6 @@ app.delete('/api/vendors/:handle/settings/images/:imageType',
 // =============================================================================
 
 /**
- * GET /api/vendors/:handle/email/segments
- * Returns available SQL-driven segments for dashboard dropdown.
- */
-app.get('/api/vendors/:handle/email/segments',
-  requireShopifyAuth,
-  requireVendorAuth,
-  async (req, res) => {
-    try {
-      const pool = await getPool();
-      const { handle } = req.params;
-
-      const result = await pool.request()
-        .input('vendorHandle', sql.NVarChar, handle)
-        .query(`
-          SELECT name, key_name
-          FROM email_segments
-          WHERE vendor_handle = @vendorHandle
-          ORDER BY name
-        `);
-
-      res.json({ segments: result.recordset });
-    } catch (err) {
-      console.error('[Segments] fetch error:', err.message);
-      res.status(500).json({ error: 'Failed to fetch segments' });
-    }
-  }
-);
-
-/**
  * GET /api/vendors/:handle/subscribers/count
  * Returns subscriber count from Azure SQL for a given audience segment.
  * Query param: ?audience=all|newsletter|sms_opted_in|recent_buyers
@@ -1600,7 +1548,7 @@ app.get('/api/vendors/:handle/subscribers/count',
     const audience   = req.query.audience || 'all';
     try {
       const pool  = await getPool();
-      const where = await getSegmentWhereClause(pool, handle, audience);
+      const where = buildAudienceQuery(handle, audience);
       const result = await pool.request()
         .input('vendorHandle', sql.NVarChar, handle)
         .query(`SELECT COUNT(*) AS cnt ${where}`);
@@ -1646,7 +1594,7 @@ app.post('/api/vendors/:handle/email/send',
     try {
       // ── 1. Fetch recipient list from Azure SQL ─────────────────────────
       const pool  = await getPool();
-      const where = await getSegmentWhereClause(pool, handle, audience);
+      const where = buildAudienceQuery(handle, audience);
       const result = await pool.request()
         .input('vendorHandle', sql.NVarChar, handle)
         .query(`SELECT c.id, c.email, c.first_name ${where}`);
@@ -1688,6 +1636,12 @@ app.post('/api/vendors/:handle/email/send',
               },
             },
             ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,
+            Headers: [
+              { Name: 'List-Unsubscribe',      Value: listUnsub },
+              { Name: 'List-Unsubscribe-Post',  Value: 'List-Unsubscribe=One-Click' },
+              { Name: 'X-Campaign-ID',          Value: campaignId },
+              { Name: 'X-Vendor-Handle',        Value: handle },
+            ],
           }));
 
           const sesMessageId = sesResponse.MessageId;
@@ -1757,16 +1711,16 @@ app.post('/api/vendors/:handle/email/send',
 // =============================================================================
 
 /**
- * POST /api/vendors/:handle/email/test
+ * POST /api/vendors/:vendor/email/test
  * Sends a single test email via SES. Requires vendor auth.
  */
-app.post("/api/vendors/:handle/email/test",
+app.post("/api/vendors/:vendor/email/test",
   requireShopifyAuth,
   requireVendorAuth,
   async (req, res) => {
     try {
       const { to, subject, htmlContent } = req.body;
-      const handle = req.params.handle;
+      const handle = req.params.vendor;
       const vendorDisplayName = VENDOR_MAP[handle] || handle;
       const fromEmail = process.env.SES_FROM_EMAIL || "hello@halfcourse.com";
 
@@ -1795,6 +1749,92 @@ app.post("/api/vendors/:handle/email/test",
     }
   }
 );
+
+// =============================================================================
+// =============================================================================
+// SUBSCRIBE ENDPOINT
+// =============================================================================
+
+/**
+ * POST /api/vendors/:handle/subscribe
+ * Inserts a new contact into the contacts table (if not already present)
+ * and creates a vendor_subscriptions row for this vendor.
+ * Used by storefront subscription forms.
+ *
+ * Body:
+ *   email       {string}  Required
+ *   first_name  {string}  Optional
+ *   last_name   {string}  Optional
+ */
+app.post('/api/vendors/:handle/subscribe', async (req, res) => {
+  try {
+    const { handle } = req.params;
+    const { email, first_name, last_name } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email required' });
+    }
+
+    const pool = await getPool();
+
+    // Upsert contact
+    await pool.request()
+      .input('email',      sql.NVarChar, email.toLowerCase().trim())
+      .input('first_name', sql.NVarChar, first_name || null)
+      .input('last_name',  sql.NVarChar, last_name  || null)
+      .query(`
+        IF NOT EXISTS (SELECT 1 FROM contacts WHERE email = @email)
+        BEGIN
+          INSERT INTO contacts (email, first_name, last_name, global_status, created_at, updated_at)
+          VALUES (@email, @first_name, @last_name, 'subscribed', GETUTCDATE(), GETUTCDATE())
+        END
+        ELSE
+        BEGIN
+          -- Update name fields if they were blank before
+          UPDATE contacts
+          SET
+            first_name = COALESCE(first_name, @first_name),
+            last_name  = COALESCE(last_name,  @last_name),
+            updated_at = GETUTCDATE()
+          WHERE email = @email
+        END
+      `);
+
+    // Upsert vendor subscription row
+    await pool.request()
+      .input('email',        sql.NVarChar, email.toLowerCase().trim())
+      .input('vendorHandle', sql.NVarChar, handle)
+      .query(`
+        DECLARE @contactId INT;
+        SELECT @contactId = id FROM contacts WHERE email = @email;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM vendor_subscriptions
+          WHERE contact_id = @contactId AND vendor_handle = @vendorHandle
+        )
+        BEGIN
+          INSERT INTO vendor_subscriptions (contact_id, vendor_handle, status, source, created_at)
+          VALUES (@contactId, @vendorHandle, 'subscribed', 'storefront', GETUTCDATE())
+        END
+        ELSE
+        BEGIN
+          -- Re-subscribe if they had previously unsubscribed
+          UPDATE vendor_subscriptions
+          SET status = 'subscribed', unsubscribed_at = NULL, updated_at = GETUTCDATE()
+          WHERE contact_id = @contactId
+            AND vendor_handle = @vendorHandle
+            AND status = 'unsubscribed'
+        END
+      `);
+
+    console.log(`[Subscribe] ${email} → ${handle}`);
+    return res.json({ success: true });
+
+  } catch (err) {
+    console.error('[Subscribe] error:', err.message);
+    return res.status(500).json({ error: 'Subscription failed' });
+  }
+});
 
 // =============================================================================
 // UNSUBSCRIBE ENDPOINT
