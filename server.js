@@ -1858,27 +1858,34 @@ app.post('/api/vendors/:handle/subscribe', async (req, res) => {
     const pool = await getPool();
 
     // Upsert contact
-    await pool.request()
-      .input('email',      sql.NVarChar, email.toLowerCase().trim())
-      .input('first_name', sql.NVarChar, first_name || null)
-      .input('last_name',  sql.NVarChar, last_name  || null)
-      .query(`
-        IF NOT EXISTS (SELECT 1 FROM contacts WHERE email = @email)
-        BEGIN
-          INSERT INTO contacts (email, first_name, last_name, global_status, created_at, updated_at)
-          VALUES (@email, @first_name, @last_name, 'subscribed', GETUTCDATE(), GETUTCDATE())
-        END
-        ELSE
-        BEGIN
-          -- Update name fields if they were blank before
-          UPDATE contacts
-          SET
-            first_name = COALESCE(first_name, @first_name),
-            last_name  = COALESCE(last_name,  @last_name),
-            updated_at = GETUTCDATE()
-          WHERE email = @email
-        END
-      `);
+await pool.request()
+  .input('email', sql.NVarChar, email.toLowerCase())
+  .input('first_name', sql.NVarChar, first_name || null)
+  .input('last_name', sql.NVarChar, last_name || null)
+  .input('vendor_handle', sql.NVarChar, handle)
+  .query(`
+    IF NOT EXISTS (SELECT 1 FROM contacts WHERE email = @email)
+    BEGIN
+      INSERT INTO contacts (
+        email,
+        first_name,
+        last_name,
+        global_status,
+        vendor_handle,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        @email,
+        @first_name,
+        @last_name,
+        'subscribed',
+        @vendor_handle,
+        GETUTCDATE(),
+        GETUTCDATE()
+      )
+    END
+  `);
 
     // Upsert vendor subscription row
     await pool.request()
