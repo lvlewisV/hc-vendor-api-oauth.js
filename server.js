@@ -1642,6 +1642,52 @@ app.get('/api/vendors/:handle/subscribers/count',
   }
 );
 
+// =============================================================================
+// GET EMAIL SEGMENTS
+// =============================================================================
+
+app.get('/api/vendors/:handle/email/segments',
+  requireShopifyAuth,
+  requireVendorAuth,
+  async (req, res) => {
+    const { handle } = req.params;
+
+    try {
+      const pool = await getPool();
+
+      const result = await pool.request()
+        .input('vendorHandle', sql.NVarChar, handle)
+        .query(`
+          SELECT DISTINCT
+            CASE 
+              WHEN vs.source = 'newsletter' THEN 'newsletter'
+              WHEN c.sms_status = 'subscribed' THEN 'sms_opted_in'
+              WHEN c.last_order_at >= DATEADD(day, -30, GETUTCDATE()) THEN 'recent_buyers'
+              ELSE 'all'
+            END AS segment_key
+          FROM contacts c
+          JOIN vendor_subscriptions vs 
+            ON vs.contact_id = c.id
+          WHERE vs.vendor_handle = @vendorHandle
+            AND vs.status = 'subscribed'
+        `);
+
+      const segments = [
+        { key: 'all', label: 'All Subscribers' },
+        { key: 'newsletter', label: 'Newsletter Only' },
+        { key: 'sms_opted_in', label: 'SMS Opted In' },
+        { key: 'recent_buyers', label: 'Recent Buyers (30d)' }
+      ];
+
+      return res.json(segments);
+
+    } catch (err) {
+      console.error('[Segments] error:', err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
 /**
  * POST /api/vendors/:handle/email/send
  * Sends an email campaign via Amazon SES to all contacts in the chosen
