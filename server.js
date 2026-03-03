@@ -1732,43 +1732,60 @@ app.get('/api/vendors/:handle/subscribers/count',
 );
 
 // =============================================================================
-// GET EMAIL SEGMENTS
+// ROUTES: EMAIL SEGMENTS
 // =============================================================================
 
+/**
+ * GET /api/vendors/:handle/email/segments
+ *
+ * Returns audience segments that have at least 1 eligible subscriber.
+ * Empty segments are omitted so the frontend dropdown never shows an option
+ * that would produce a "0 recipients" send error.
+ *
+ * Each segment is counted using the same buildAudienceQuery() used by
+ * /subscribers/count and /email/send, so counts are always consistent.
+ *
+ * Response: [{ key: 'all', label: 'All Subscribers', count: 42 }, ...]
+ */
 app.get('/api/vendors/:handle/email/segments',
   requireShopifyAuth,
   requireVendorAuth,
   async (req, res) => {
     const { handle } = req.params;
 
+    const SEGMENT_DEFINITIONS = [
+      { key: 'all',           label: 'All Subscribers'        },
+      { key: 'newsletter',    label: 'Newsletter Subscribers'  },
+      { key: 'sms_opted_in',  label: 'SMS Opted-In'           },
+      { key: 'recent_buyers', label: 'Recent Buyers (30d)'    },
+    ];
+
     try {
       const pool = await getPool();
 
-      const result = await pool.request()
-        .input('vendorHandle', sql.NVarChar, handle)
-        .query(`
-          SELECT DISTINCT
-            CASE 
-              WHEN vs.source = 'newsletter' THEN 'newsletter'
-              WHEN c.sms_status = 'subscribed' THEN 'sms_opted_in'
-              WHEN c.last_order_at >= DATEADD(day, -30, GETUTCDATE()) THEN 'recent_buyers'
-              ELSE 'all'
-            END AS segment_key
-          FROM contacts c
-          JOIN vendor_subscriptions vs 
-            ON vs.contact_id = c.id
-          WHERE vs.vendor_handle = @vendorHandle
-            AND vs.status = 'subscribed'
-        `);
+      // Count all segments in parallel
+      const counted = await Promise.all(
+        SEGMENT_DEFINITIONS.map(async (seg) => {
+          try {
+            const where = buildAudienceQuery(handle, seg.key);
+            const result = await pool.request()
+              .input('vendorHandle', sql.NVarChar, handle)
+              .query(`SELECT COUNT(*) AS cnt ${where}`);
+            return { ...seg, count: result.recordset[0]?.cnt ?? 0 };
+          } catch (segErr) {
+            // If one segment fails (e.g. missing column), skip it rather than
+            // blowing up the entire response.
+            console.warn(`[Segments] count failed for "${seg.key}":`, segErr.message);
+            return { ...seg, count: 0 };
+          }
+        })
+      );
 
-      const segments = [
-        { key: 'all', label: 'All Subscribers' },
-        { key: 'newsletter', label: 'Newsletter Only' },
-        { key: 'sms_opted_in', label: 'SMS Opted In' },
-        { key: 'recent_buyers', label: 'Recent Buyers (30d)' }
-      ];
+      // Only return segments with at least one eligible subscriber
+      const nonEmpty = counted.filter(s => s.count > 0);
 
-      return res.json(segments);
+      console.log(`[Segments] ${handle}: ${nonEmpty.map(s => `${s.key}=${s.count}`).join(', ')}`);
+      return res.json(nonEmpty);
 
     } catch (err) {
       console.error('[Segments] error:', err.message);
