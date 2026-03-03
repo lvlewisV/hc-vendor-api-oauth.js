@@ -1702,20 +1702,31 @@ app.get('/api/vendors/:handle/subscribers/count',
   requireShopifyAuth,
   requireVendorAuth,
   async (req, res) => {
-    const { handle } = req.params;
-    const audience   = req.query.audience || 'all';
     try {
-      const pool  = await getPool();
-      const where = buildAudienceQuery(handle, audience);
+      const { handle } = req.params;
+      const { audience = 'all' } = req.query;
+
+      const pool = await getPool();
+
+      // 🔹 Build dynamic audience query
+      const { query } = buildAudienceQuery(audience, handle);
+
+      const countQuery = `
+        SELECT COUNT(DISTINCT c.contact_id) AS cnt
+        ${query}
+      `;
+
       const result = await pool.request()
         .input('vendorHandle', sql.NVarChar, handle)
-        .query(`SELECT COUNT(*) AS cnt ${where}`);
-      const count = result.recordset[0].cnt;
-      console.log(`[SQL] ${handle}/${audience} subscriber count: ${count}`);
+        .query(countQuery);
+
+      const count = result.recordset[0]?.cnt || 0;
+
       return res.json({ count });
+
     } catch (err) {
       console.error('[SQL] subscriber count error:', err.message);
-      return res.json({ count: 0 });
+      return res.status(500).json({ error: err.message });
     }
   }
 );
