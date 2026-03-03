@@ -425,25 +425,103 @@ function verifyUnsubscribeToken(token) {
  * Build the SQL WHERE clause for an audience segment.
  * Segment values must match the options in the frontend dropdown.
  */
-function buildAudienceQuery(vendorHandle, audience) {
-  const base = `
+function buildAudienceQuery(audienceKey, vendorHandle) {
+  const baseJoin = `
     FROM contacts c
-    JOIN vendor_subscriptions vs ON vs.contact_id = c.id
-    WHERE vs.vendor_handle = @vendorHandle
-      AND vs.status = 'subscribed'
-      AND c.email IS NOT NULL
-      AND c.email NOT IN (SELECT email FROM suppressions WHERE vendor_handle = @vendorHandle OR vendor_handle IS NULL)
+    INNER JOIN vendor_subscriptions vs
+      ON vs.contact_id = c.contact_id
   `;
-  switch (audience) {
-    case 'newsletter':
-      return base + ` AND vs.source = 'newsletter'`;
-    case 'sms_opted_in':
-      return base + ` AND c.sms_status = 'subscribed'`;
-    case 'recent_buyers':
-      return base + ` AND c.last_order_at >= DATEADD(day, -30, GETUTCDATE())`;
+
+  const baseWhere = `
+    WHERE vs.vendor_handle = @vendorHandle
+      AND vs.vendor_status = 'subscribed'
+      AND c.global_status = 'subscribed'
+  `;
+
+  switch (audienceKey) {
+
     case 'all':
+      return {
+        query: `
+          ${baseJoin}
+          ${baseWhere}
+        `,
+        params: { vendorHandle }
+      };
+
+    case 'sms_opted_in':
+      return {
+        query: `
+          ${baseJoin}
+          ${baseWhere}
+          AND c.sms_status = 'subscribed'
+        `,
+        params: { vendorHandle }
+      };
+
+    case 'recent_buyers':
+      return {
+        query: `
+          ${baseJoin}
+          INNER JOIN contact_orders o
+            ON o.contact_id = c.contact_id
+            AND o.vendor_handle = @vendorHandle
+          ${baseWhere}
+          AND o.order_date >= DATEADD(day, -30, GETUTCDATE())
+        `,
+        params: { vendorHandle }
+      };
+
+    case 'repeat_buyers':
+      return {
+        query: `
+          ${baseJoin}
+          INNER JOIN contact_orders o
+            ON o.contact_id = c.contact_id
+            AND o.vendor_handle = @vendorHandle
+          ${baseWhere}
+          GROUP BY c.contact_id, c.email
+          HAVING COUNT(o.id) >= 2
+        `,
+        params: { vendorHandle }
+      };
+
+    case 'vip':
+      return {
+        query: `
+          ${baseJoin}
+          INNER JOIN contact_orders o
+            ON o.contact_id = c.contact_id
+            AND o.vendor_handle = @vendorHandle
+          ${baseWhere}
+          GROUP BY c.contact_id, c.email
+          HAVING SUM(o.order_total) >= 250
+        `,
+        params: { vendorHandle }
+      };
+
+    case 'winback_90':
+      return {
+        query: `
+          ${baseJoin}
+          INNER JOIN contact_orders o
+            ON o.contact_id = c.contact_id
+            AND o.vendor_handle = @vendorHandle
+          ${baseWhere}
+          GROUP BY c.contact_id, c.email
+          HAVING MAX(o.order_date) <= DATEADD(day, -90, GETUTCDATE())
+        `,
+        params: { vendorHandle }
+      };
+
     default:
-      return base;
+      return {
+        query: `
+          ${baseJoin}
+          ${baseWhere}
+        `,
+        params: { vendorHandle }
+      };
   }
 }
 
