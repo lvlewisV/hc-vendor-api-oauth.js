@@ -458,11 +458,14 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
       AND vs.vendor_status = 'subscribed'
       AND c.global_status = 'subscribed'
       AND c.email IS NOT NULL
-      AND c.contact_id NOT IN (
-  SELECT s.contact_id
+      AND NOT EXISTS (
+  SELECT 1
   FROM suppressions s
-  WHERE s.vendor_tag = @vendorHandle
-     OR s.vendor_scope = 'global'
+  WHERE s.contact_id = c.contact_id
+  AND (
+       s.vendor_tag = @vendorHandle
+       OR s.vendor_scope = 'global'
+  )
 )
   `;
 
@@ -1678,8 +1681,8 @@ app.post('/api/vendors/:vendor/subscribe', async (req, res) => {
             sms_status    = CASE WHEN @smsStatus = 'subscribed' THEN 'subscribed' ELSE target.sms_status END,
             updated_at    = GETUTCDATE()
         WHEN NOT MATCHED THEN
-          INSERT (email, first_name, last_name, phone, sms_status, vendor_handle, global_status, created_at, updated_at)
-          VALUES (@email, @firstName, @lastName, @phone, @smsStatus, @vendorHandle, 'subscribed', GETUTCDATE(), GETUTCDATE());
+          INSERT (email, first_name, last_name, phone, sms_status, global_status, created_at, updated_at)
+          VALUES (@email, @firstName, @lastName, @phone, @smsStatus, 'subscribed', GETUTCDATE(), GETUTCDATE());
       `);
 
     // 2. Get contact_id
