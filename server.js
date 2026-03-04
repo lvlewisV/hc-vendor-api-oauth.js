@@ -92,7 +92,7 @@ const VENDOR_MAP = {
 };
 
 // Token storage file path (for persistence across restarts)
-const TOKEN_FILE = process.env.TOKEN_FILE || '/tmp/shopify_tokens.json';
+const TOKEN_FILE = process.env.TOKEN_FILE || path.join(__dirname, 'shopify_tokens.json');
 
 // =============================================================================
 // TOKEN PERSISTENCE
@@ -127,6 +127,26 @@ function saveTokens() {
 
 // Load tokens on startup
 loadTokens();
+
+(async () => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('store', sql.NVarChar, SHOPIFY_STORE)
+      .query(`
+        SELECT access_token
+        FROM shopify_tokens
+        WHERE store = @store
+      `);
+
+    if (result.recordset.length) {
+      shopifyAccessTokens[SHOPIFY_STORE] = result.recordset[0].access_token;
+      console.log('✅ Loaded Shopify token from SQL');
+    }
+  } catch (err) {
+    console.error('⚠️ Could not load Shopify token from SQL:', err.message);
+  }
+})();
 
 // Vendor session tokens (in-memory, expire after 24 hours)
 const vendorSessions = {};
@@ -434,7 +454,7 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
   `;
 
   const baseWhere = `
-    WHERE vs.vendor_tag = @vendorHandle
+    WHERE vs.vendor_handle = @vendorHandle
       AND vs.vendor_status = 'subscribed'
       AND c.global_status = 'subscribed'
       AND c.email IS NOT NULL
@@ -486,7 +506,7 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
             ON o.contact_id = c.contact_id
             AND o.vendor_handle = @vendorHandle
           ${baseWhere}
-          GROUP BY c.contact_id, c.email
+          GROUP BY c.contact_id, c.email, c.first_name
           HAVING SUM(o.order_total) >= 250
         `
       };
@@ -499,7 +519,7 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
             ON o.contact_id = c.contact_id
             AND o.vendor_handle = @vendorHandle
           ${baseWhere}
-          GROUP BY c.contact_id, c.email
+          GROUP BY c.contact_id, c.email, c.first_name
           HAVING MAX(o.order_date) <= DATEADD(day, -90, GETUTCDATE())
         `
       };
@@ -740,11 +760,29 @@ app.get('/auth/callback', async (req, res) => {
     
     const tokenData = await tokenResponse.json();
     
-    // Store the access token
-    shopifyAccessTokens[SHOPIFY_STORE] = tokenData.access_token;
+// Store token in memory
+shopifyAccessTokens[SHOPIFY_STORE] = tokenData.access_token;
+
+// Save to SQL
+const pool = await getPool();
+
+await pool.request()
+  .input('store', sql.NVarChar, SHOPIFY_STORE)
+  .input('token', sql.NVarChar, tokenData.access_token)
+  .query(`
+    MERGE shopify_tokens AS t
+    USING (SELECT @store AS store) s
+    ON t.store = s.store
+    WHEN MATCHED THEN
+      UPDATE SET access_token = @token, updated_at = GETUTCDATE()
+    WHEN NOT MATCHED THEN
+      INSERT (store, access_token, updated_at)
+      VALUES (@store, @token, GETUTCDATE())
+  `);
+
+// Save to file (optional backup)
+saveTokens();
     
-    // Persist to file
-    saveTokens();
     
     console.log('✅ Shopify OAuth successful for store:', SHOPIFY_STORE);
     
@@ -1659,14 +1697,14 @@ app.post('/api/vendors/:vendor/subscribe', async (req, res) => {
       .input('source',      sql.NVarChar, source || 'form')
       .query(`
         MERGE vendor_subscriptions AS target
-        USING (SELECT @contactId AS contact_id, @vendorTag AS vendor_tag) AS src
-          ON target.contact_id = src.contact_id AND target.vendor_tag = src.vendor_tag
+        USING (SELECT @contactId AS contact_id, @vendorTag AS vendor_handle) AS src
+          ON target.contact_id = src.contact_id AND target.vendor_handle = src.vendor_handle
         WHEN MATCHED THEN
           UPDATE SET
             vendor_status  = 'subscribed',
             updated_at     = GETUTCDATE()
         WHEN NOT MATCHED THEN
-          INSERT (vendor_tag, contact_id, vendor_status, source, subscribed_at, created_at, updated_at)
+          INSERT (vendor_handle, contact_id, vendor_status, source, subscribed_at, created_at, updated_at)
           VALUES (@vendorTag, @contactId, 'subscribed', @source, GETUTCDATE(), GETUTCDATE(), GETUTCDATE());
       `);
 
@@ -1823,7 +1861,7 @@ app.post('/api/vendors/:handle/email/send',
       const result = await pool.request()
         .input('vendorHandle', sql.NVarChar, handle)
         .query(`
-  SELECT c.contact_id, c.email, c.first_name
+  SELECT DISTINCT c.contact_id, c.email, c.first_name
   ${query}
 `);
 
@@ -1877,7 +1915,7 @@ app.post('/api/vendors/:handle/email/send',
           // ── Write per-recipient row with MessageId ─────────────────────
           await pool.request()
             .input('campaign_id',    sql.NVarChar,  campaignId)
-            .input('contact_id',     sql.Int,        contact.id)
+            .input('contact_id',     sql.Int, contact.contact_id)
             .input('email',          sql.NVarChar,  contact.email)
             .input('ses_message_id', sql.NVarChar,  sesMessageId)
             .input('status',         sql.NVarChar,  'sent')
@@ -1978,98 +2016,6 @@ app.post("/api/vendors/:vendor/email/test",
   }
 );
 
-// =============================================================================
-// =============================================================================
-// SUBSCRIBE ENDPOINT
-// =============================================================================
-
-/**
- * POST /api/vendors/:handle/subscribe
- * Inserts a new contact into the contacts table (if not already present)
- * and creates a vendor_subscriptions row for this vendor.
- * Used by storefront subscription forms.
- *
- * Body:
- *   email       {string}  Required
- *   first_name  {string}  Optional
- *   last_name   {string}  Optional
- */
-app.post('/api/vendors/:handle/subscribe', async (req, res) => {
-  try {
-    const { handle } = req.params;
-    const { email, first_name, last_name } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ error: 'Email required' });
-    }
-
-    const pool = await getPool();
-
-    // Upsert contact
-await pool.request()
-  .input('email', sql.NVarChar, email.toLowerCase())
-  .input('first_name', sql.NVarChar, first_name || null)
-  .input('last_name', sql.NVarChar, last_name || null)
-  .input('vendor_handle', sql.NVarChar, handle)
-  .query(`
-    IF NOT EXISTS (SELECT 1 FROM contacts WHERE email = @email)
-    BEGIN
-      INSERT INTO contacts (
-        email,
-        first_name,
-        last_name,
-        global_status,
-        vendor_handle,
-        created_at,
-        updated_at
-      )
-      VALUES (
-        @email,
-        @first_name,
-        @last_name,
-        'subscribed',
-        @vendor_handle,
-        GETUTCDATE(),
-        GETUTCDATE()
-      )
-    END
-  `);
-
-    // Upsert vendor subscription row
-    await pool.request()
-      .input('email',        sql.NVarChar, email.toLowerCase().trim())
-      .input('vendorHandle', sql.NVarChar, handle)
-      .query(`
-        DECLARE @contactId INT;
-        SELECT @contactId = id FROM contacts WHERE email = @email;
-
-        IF NOT EXISTS (
-          SELECT 1 FROM vendor_subscriptions
-          WHERE contact_id = @contactId AND vendor_handle = @vendorHandle
-        )
-        BEGIN
-          INSERT INTO vendor_subscriptions (contact_id, vendor_handle, status, source, created_at)
-          VALUES (@contactId, @vendorHandle, 'subscribed', 'storefront', GETUTCDATE())
-        END
-        ELSE
-        BEGIN
-          -- Re-subscribe if they had previously unsubscribed
-          UPDATE vendor_subscriptions
-          SET status = 'subscribed', unsubscribed_at = NULL, updated_at = GETUTCDATE()
-          WHERE contact_id = @contactId
-            AND vendor_handle = @vendorHandle
-            AND status = 'unsubscribed'
-        END
-      `);
-
-    console.log(`[Subscribe] ${email} → ${handle}`);
-    return res.json({ success: true });
-
-  } catch (err) {
-    console.error('[Subscribe] error:', err.message);
-    return res.status(500).json({ error: 'Subscription failed' });
-  }
-});
 
 // =============================================================================
 // UNSUBSCRIBE ENDPOINT
@@ -2099,8 +2045,10 @@ app.get("/api/unsubscribe", async (req, res) => {
       .input("vendorHandle", sql.NVarChar, vendor || null)
       .query(`
         UPDATE vendor_subscriptions
-        SET status = 'unsubscribed', unsubscribed_at = GETUTCDATE()
-        WHERE contact_id = (SELECT id FROM contacts WHERE email = @email)
+        SET vendor_status = 'unsubscribed', unsubscribed_at = GETUTCDATE()
+        WHERE contact_id = (
+  SELECT contact_id FROM contacts WHERE email = @email
+)
           AND (@vendorHandle IS NULL OR vendor_handle = @vendorHandle)
       `);
     console.log(`[Unsubscribe] ${email} unsubscribed from ${vendor || "all"}`);
@@ -2135,8 +2083,10 @@ app.post("/api/unsubscribe", express.urlencoded({ extended: false }), async (req
       .input("email",        sql.NVarChar, email)
       .input("vendorHandle", sql.NVarChar, vendor || null)
       .query(`
-        UPDATE vendor_subscriptions SET status = 'unsubscribed', unsubscribed_at = GETUTCDATE()
-        WHERE contact_id = (SELECT id FROM contacts WHERE email = @email)
+        UPDATE vendor_subscriptions SET vendor_status = 'unsubscribed', unsubscribed_at = GETUTCDATE()
+        WHERE contact_id = (
+  SELECT contact_id FROM contacts WHERE email = @email
+)
           AND (@vendorHandle IS NULL OR vendor_handle = @vendorHandle)
       `);
     res.json({ success: true });
