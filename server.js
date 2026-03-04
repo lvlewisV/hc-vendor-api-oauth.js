@@ -1887,8 +1887,9 @@ app.post('/api/vendors/:handle/email/send',
 
           // Personalise HTML — inject first name if present, inject unsubscribe link
           const personalised = htmlContent
-            .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
-            .replace(/UNSUBSCRIBE_LINK/g, unsubUrl);
+  .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
+  .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
+  .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl);
 
           const plainText = stripHtmlToText(personalised)
             + `\n\nTo unsubscribe: ${unsubUrl}`;
@@ -2128,8 +2129,9 @@ app.post('/api/vendors/:handle/email/schedule',
               const listUnsub  = `<${unsubUrl}>, <mailto:unsubscribe@halfcourse.com?subject=unsubscribe>`;
 
               const personalised = html_content
-                .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
-                .replace(/UNSUBSCRIBE_LINK/g, unsubUrl);
+  .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
+  .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
+  .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl);
 
               const sesResponse = await ses.send(new SendEmailCommand({
                 Source:      `${vendorDisplayName} @ HalfCourse <${fromEmail}>`,
