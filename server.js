@@ -2101,31 +2101,16 @@ OUTPUT INSERTED.*;
         const { id, campaign_id, vendor_handle, audience, subject,
                 preview_text, html_content } = campaign;
         try {
+          
           // Fetch audience contacts (reuse same query logic as /email/send)
-          let contactsQuery = `
-            SELECT c.contact_id, c.email
-FROM contacts c
-JOIN vendor_subscriptions vs
-  ON vs.contact_id = c.contact_id
-  AND vs.vendor_handle = @handle
-  AND vs.vendor_status = 'subscribed'
-WHERE c.global_status = 'subscribed'
-AND c.email IS NOT NULL
-AND c.email NOT IN (
-  SELECT email FROM suppressions
-)
-          `;
-          const req = pool.request().input('handle', sql.NVarChar, vendor_handle);
+const { query } = buildAudienceQuery(audience, vendor_handle);
 
-          if (audience && audience !== 'all') {
-            contactsQuery += `
-              AND c.id IN (
-                SELECT contact_id FROM contact_segments
-                WHERE  segment_id = (SELECT id FROM segments WHERE name = @audience AND vendor_handle = @handle)
-              )`;
-            req.input('audience', sql.NVarChar, audience);
-          }
-          const contacts = (await req.query(contactsQuery)).recordset;
+const contacts = (await pool.request()
+  .input('vendorHandle', sql.NVarChar, vendor_handle)
+  .query(`
+    SELECT DISTINCT c.contact_id, c.email, c.first_name
+    ${query}
+  `)).recordset;
 
           if (!contacts.length) {
             await pool.request()
@@ -2138,20 +2123,10 @@ AND c.email NOT IN (
           const vendorDisplayName = VENDOR_MAP[vendor_handle] || vendor_handle;
           const fromAddress = `${vendorDisplayName} via HalfCourse <hello@halfcourse.com>`;
           const unsubBase   = `https://halfcourse-vendor-api.onrender.com/unsubscribe`;
-          const crypto      = require('crypto');
-          const HMAC_SECRET = process.env.HMAC_SECRET || 'changeme';
-
-          let sent = 0, failed = 0;
-
-          for (const contact of contacts) {
-            try {
-              const token = crypto.createHmac('sha256', HMAC_SECRET)
-                .update(`${contact.email}:${vendor_handle}`).digest('hex');
+const token = signUnsubscribeToken(contact.email);
               const unsubLink = `${unsubBase}?email=${encodeURIComponent(contact.email)}&vendor=${vendor_handle}&token=${token}`;
               const personalised = html_content.replace(/{{UNSUB_LINK}}/g, unsubLink);
 
-              const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
-              const ses = new SESClient({ region: process.env.AWS_REGION || 'us-east-1' });
 
               await ses.send(new SendEmailCommand({
                 Source:      fromAddress,
@@ -2176,7 +2151,8 @@ AND c.email NOT IN (
                 .input('status',      sql.NVarChar, 'sent')
                 .input('sent_at',     sql.DateTimeOffset, new Date())
                 .query(`
-                  INSERT INTO email_send_log (campaign_id, contact_id, email, ses_message_id, status, sent_at)
+                  INSERT INTO email_send_recipients
+                  (campaign_id, contact_id, email, ses_message_id, status, sent_at)
                   VALUES (@campaign_id, @contact_id, @email, NULL, @status, @sent_at)
                 `);
               sent++;
