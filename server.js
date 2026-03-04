@@ -1767,10 +1767,13 @@ app.get('/api/vendors/:handle/email/segments',
       const counted = await Promise.all(
         SEGMENT_DEFINITIONS.map(async (seg) => {
           try {
-            const where = buildAudienceQuery(handle, seg.key);
-            const result = await pool.request()
-              .input('vendorHandle', sql.NVarChar, handle)
-              .query(`SELECT COUNT(*) AS cnt ${where}`);
+            const { query } = buildAudienceQuery(seg.key, handle);
+const result = await pool.request()
+  .input('vendorHandle', sql.NVarChar, handle)
+  .query(`
+    SELECT COUNT(DISTINCT c.contact_id) AS cnt
+    ${query}
+  `);
             return { ...seg, count: result.recordset[0]?.cnt ?? 0 };
           } catch (segErr) {
             // If one segment fails (e.g. missing column), skip it rather than
@@ -1826,10 +1829,13 @@ app.post('/api/vendors/:handle/email/send',
     try {
       // ── 1. Fetch recipient list from Azure SQL ─────────────────────────
       const pool  = await getPool();
-      const where = buildAudienceQuery(handle, audience);
+      const { query } = buildAudienceQuery(audience, handle);
       const result = await pool.request()
         .input('vendorHandle', sql.NVarChar, handle)
-        .query(`SELECT c.id, c.email, c.first_name ${where}`);
+        .query(`
+  SELECT c.contact_id, c.email, c.first_name
+  ${query}
+`);
 
       const recipients = result.recordset;
       if (recipients.length === 0) {
