@@ -1973,6 +1973,244 @@ app.post('/api/vendors/:handle/email/send',
 );
 
 // =============================================================================
+// AMAZON SES — SCHEDULE CAMPAIGN
+// =============================================================================
+
+/**
+ * POST /api/vendors/:handle/email/schedule
+ * Stores a campaign to be sent at a future scheduled_at time.
+ * Requires vendor auth. Uses Azure SQL `scheduled_campaigns` table.
+ *
+ * Table DDL (run once):
+ *   CREATE TABLE scheduled_campaigns (
+ *     id              INT IDENTITY PRIMARY KEY,
+ *     campaign_id     NVARCHAR(100) NOT NULL,
+ *     vendor_handle   NVARCHAR(100) NOT NULL,
+ *     audience        NVARCHAR(100) NOT NULL DEFAULT 'all',
+ *     subject         NVARCHAR(500) NOT NULL,
+ *     preview_text    NVARCHAR(500),
+ *     html_content    NVARCHAR(MAX) NOT NULL,
+ *     scheduled_at    DATETIMEOFFSET NOT NULL,
+ *     status          NVARCHAR(20)  NOT NULL DEFAULT 'pending',
+ *     created_at      DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+ *     sent_at         DATETIMEOFFSET,
+ *     sent_count      INT,
+ *     failed_count    INT,
+ *     error_message   NVARCHAR(1000),
+ *     INDEX IX_sched_vendor (vendor_handle),
+ *     INDEX IX_sched_status (status),
+ *     INDEX IX_sched_at    (scheduled_at)
+ *   );
+ */
+app.post('/api/vendors/:handle/email/schedule',
+  requireShopifyAuth,
+  requireVendorAuth,
+  async (req, res) => {
+    try {
+      const handle = req.params.handle;
+      const { subject, previewText, htmlContent, audience = 'all', scheduled_at } = req.body;
+
+      if (!subject || !htmlContent) {
+        return res.status(400).json({ error: 'subject and htmlContent are required' });
+      }
+      if (!scheduled_at) {
+        return res.status(400).json({ error: 'scheduled_at is required (ISO 8601 string)' });
+      }
+
+      const scheduledDate = new Date(scheduled_at);
+      if (isNaN(scheduledDate.getTime())) {
+        return res.status(400).json({ error: 'Invalid scheduled_at date format' });
+      }
+      if (scheduledDate <= new Date()) {
+        return res.status(400).json({ error: 'scheduled_at must be in the future' });
+      }
+
+      const campaignId = `${handle}-sched-${Date.now()}`;
+
+      // Persist to Azure SQL
+      const pool = await getSqlPool();
+      await pool.request()
+        .input('campaign_id',   sql.NVarChar, campaignId)
+        .input('vendor_handle', sql.NVarChar, handle)
+        .input('audience',      sql.NVarChar, audience)
+        .input('subject',       sql.NVarChar, subject)
+        .input('preview_text',  sql.NVarChar, previewText || '')
+        .input('html_content',  sql.NVarChar(sql.MAX), htmlContent)
+        .input('scheduled_at',  sql.DateTimeOffset, scheduledDate)
+        .query(`
+          INSERT INTO scheduled_campaigns
+            (campaign_id, vendor_handle, audience, subject, preview_text, html_content, scheduled_at, status)
+          VALUES
+            (@campaign_id, @vendor_handle, @audience, @subject, @preview_text, @html_content, @scheduled_at, 'pending')
+        `);
+
+      console.log(`[SCHEDULE] Campaign ${campaignId} scheduled for ${scheduledDate.toISOString()} by ${handle}`);
+
+      return res.json({
+        success:     true,
+        campaignId,
+        scheduledAt: scheduledDate.toISOString(),
+        message:     `Campaign scheduled for ${scheduledDate.toLocaleString()}`
+      });
+
+    } catch (err) {
+      console.error('[SCHEDULE] Error:', err.message);
+      return res.status(500).json({ error: err.message || 'Failed to schedule campaign' });
+    }
+  }
+);
+
+// =============================================================================
+// SCHEDULED CAMPAIGN RUNNER (polls every 60 s)
+// =============================================================================
+/**
+ * Checks `scheduled_campaigns` every minute for pending campaigns whose
+ * scheduled_at has passed, then fires them through the same SES send
+ * pipeline used by /email/send.
+ */
+(function startScheduledCampaignRunner() {
+  const POLL_INTERVAL_MS = 60 * 1000; // 1 minute
+
+  async function runDueScheduledCampaigns() {
+    let pool;
+    try {
+      pool = await getSqlPool();
+
+      // Claim due campaigns atomically to avoid double-fires on restart
+      const claimResult = await pool.request()
+        .input('now', sql.DateTimeOffset, new Date())
+        .query(`
+          UPDATE scheduled_campaigns
+          SET    status = 'processing'
+          OUTPUT INSERTED.id, INSERTED.campaign_id, INSERTED.vendor_handle,
+                 INSERTED.audience, INSERTED.subject, INSERTED.preview_text,
+                 INSERTED.html_content, INSERTED.scheduled_at
+          WHERE  status     = 'pending'
+            AND  scheduled_at <= @now
+        `);
+
+      const due = claimResult.recordset;
+      if (!due.length) return;
+
+      console.log(`[SCHEDULE-RUNNER] ${due.length} campaign(s) due`);
+
+      for (const campaign of due) {
+        const { id, campaign_id, vendor_handle, audience, subject,
+                preview_text, html_content } = campaign;
+        try {
+          // Fetch audience contacts (reuse same query logic as /email/send)
+          let contactsQuery = `
+            SELECT c.id AS contact_id, c.email
+            FROM   contacts c
+            JOIN   vendor_subscriptions vs ON vs.contact_id = c.id
+                   AND vs.vendor_handle = @handle AND vs.status = 'subscribed'
+            WHERE  c.email NOT IN (SELECT email FROM suppressions)
+          `;
+          const req = pool.request().input('handle', sql.NVarChar, vendor_handle);
+
+          if (audience && audience !== 'all') {
+            contactsQuery += `
+              AND c.id IN (
+                SELECT contact_id FROM contact_segments
+                WHERE  segment_id = (SELECT id FROM segments WHERE name = @audience AND vendor_handle = @handle)
+              )`;
+            req.input('audience', sql.NVarChar, audience);
+          }
+          const contacts = (await req.query(contactsQuery)).recordset;
+
+          if (!contacts.length) {
+            await pool.request()
+              .input('id',       sql.Int,          id)
+              .input('sent_at',  sql.DateTimeOffset, new Date())
+              .query(`UPDATE scheduled_campaigns SET status='sent', sent_count=0, failed_count=0, sent_at=@sent_at WHERE id=@id`);
+            continue;
+          }
+
+          const vendorDisplayName = VENDOR_MAP[vendor_handle] || vendor_handle;
+          const fromAddress = `${vendorDisplayName} via HalfCourse <hello@halfcourse.com>`;
+          const unsubBase   = `https://halfcourse-vendor-api.onrender.com/unsubscribe`;
+          const crypto      = require('crypto');
+          const HMAC_SECRET = process.env.HMAC_SECRET || 'changeme';
+
+          let sent = 0, failed = 0;
+
+          for (const contact of contacts) {
+            try {
+              const token = crypto.createHmac('sha256', HMAC_SECRET)
+                .update(`${contact.email}:${vendor_handle}`).digest('hex');
+              const unsubLink = `${unsubBase}?email=${encodeURIComponent(contact.email)}&vendor=${vendor_handle}&token=${token}`;
+              const personalised = html_content.replace(/{{UNSUB_LINK}}/g, unsubLink);
+
+              const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
+              const ses = new SESClient({ region: process.env.AWS_REGION || 'us-east-1' });
+
+              await ses.send(new SendEmailCommand({
+                Source:      fromAddress,
+                Destination: { ToAddresses: [contact.email] },
+                Message: {
+                  Subject: { Data: subject, Charset: 'UTF-8' },
+                  Body:    { Html: { Data: personalised, Charset: 'UTF-8' } }
+                },
+                ConfigurationSetName: process.env.SES_CONFIG_SET,
+                Headers: [
+                  { Name: 'List-Unsubscribe',      Value: `<${unsubLink}>` },
+                  { Name: 'List-Unsubscribe-Post', Value: 'List-Unsubscribe=One-Click' },
+                  { Name: 'X-Campaign-ID',         Value: campaign_id }
+                ]
+              }));
+
+              // Log per-recipient send
+              await pool.request()
+                .input('campaign_id', sql.NVarChar, campaign_id)
+                .input('contact_id',  sql.Int,      contact.contact_id)
+                .input('email',       sql.NVarChar, contact.email)
+                .input('status',      sql.NVarChar, 'sent')
+                .input('sent_at',     sql.DateTimeOffset, new Date())
+                .query(`
+                  INSERT INTO email_send_log (campaign_id, contact_id, email, ses_message_id, status, sent_at)
+                  VALUES (@campaign_id, @contact_id, @email, NULL, @status, @sent_at)
+                `);
+              sent++;
+            } catch (sendErr) {
+              console.error(`[SCHEDULE-RUNNER] Failed for ${contact.email}:`, sendErr.message);
+              failed++;
+            }
+          }
+
+          // Mark campaign as sent
+          await pool.request()
+            .input('id',          sql.Int,          id)
+            .input('sent_at',     sql.DateTimeOffset, new Date())
+            .input('sent_count',  sql.Int,          sent)
+            .input('failed_count',sql.Int,          failed)
+            .query(`
+              UPDATE scheduled_campaigns
+              SET status='sent', sent_at=@sent_at, sent_count=@sent_count, failed_count=@failed_count
+              WHERE id=@id
+            `);
+
+          console.log(`[SCHEDULE-RUNNER] ${campaign_id} done — ${sent} sent, ${failed} failed`);
+
+        } catch (campaignErr) {
+          console.error(`[SCHEDULE-RUNNER] Campaign ${campaign_id} error:`, campaignErr.message);
+          await pool.request()
+            .input('id',    sql.Int,      id)
+            .input('error', sql.NVarChar, campaignErr.message.slice(0, 1000))
+            .query(`UPDATE scheduled_campaigns SET status='failed', error_message=@error WHERE id=@id`);
+        }
+      }
+    } catch (err) {
+      console.error('[SCHEDULE-RUNNER] Poll error:', err.message);
+    }
+  }
+
+  // Run immediately on startup, then on interval
+  setTimeout(runDueScheduledCampaigns, 5000);
+  setInterval(runDueScheduledCampaigns, POLL_INTERVAL_MS);
+  console.log('[SCHEDULE-RUNNER] Started — polling every 60 s');
+})();
+
+// =============================================================================
 // AMAZON SES — TEST SEND
 // =============================================================================
 
