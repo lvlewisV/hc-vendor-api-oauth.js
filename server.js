@@ -2080,12 +2080,16 @@ app.post('/api/vendors/:handle/email/schedule',
       const claimResult = await pool.request()
         .input('now', sql.DateTimeOffset, new Date())
         .query(`
-          UPDATE TOP (5) scheduled_campaigns
-          SET status = 'processing'
-          OUTPUT INSERTED.*
-          WHERE status='pending'
+          ;WITH due AS (
+          SELECT TOP (5) *
+          FROM scheduled_campaigns
+          WHERE status = 'pending'
           AND scheduled_at <= @now
-          ORDER BY scheduled_at;
+          ORDER BY scheduled_at
+)
+UPDATE due
+SET status = 'processing'
+OUTPUT INSERTED.*;
         `);
 
       const due = claimResult.recordset;
