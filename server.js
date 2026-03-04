@@ -2104,10 +2104,16 @@ OUTPUT INSERTED.*;
           // Fetch audience contacts (reuse same query logic as /email/send)
           let contactsQuery = `
             SELECT c.contact_id, c.email
-            FROM   contacts c
-            JOIN   vendor_subscriptions vs ON vs.contact_id = c.contact_id
-                   AND vs.vendor_handle = @handle AND vs.status = 'subscribed'
-            WHERE  c.email NOT IN (SELECT email FROM suppressions)
+FROM contacts c
+JOIN vendor_subscriptions vs
+  ON vs.contact_id = c.contact_id
+  AND vs.vendor_handle = @handle
+  AND vs.vendor_status = 'subscribed'
+WHERE c.global_status = 'subscribed'
+AND c.email IS NOT NULL
+AND c.email NOT IN (
+  SELECT email FROM suppressions
+)
           `;
           const req = pool.request().input('handle', sql.NVarChar, vendor_handle);
 
