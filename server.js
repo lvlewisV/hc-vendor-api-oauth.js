@@ -426,65 +426,34 @@ function verifyUnsubscribeToken(token) {
  * Segment values must match the options in the frontend dropdown.
  */
 function buildAudienceQuery(audienceKey, vendorHandle) {
-  const baseJoin = `
+  const base = `
     FROM contacts c
     INNER JOIN vendor_subscriptions vs
       ON vs.contact_id = c.contact_id
-  `;
-
-  const baseWhere = `
-    WHERE vs.vendor_handle = @vendorHandle
+    WHERE vs.vendor_tag = @vendorHandle
       AND vs.vendor_status = 'subscribed'
-      AND c.global_status = 'subscribed'
+      AND c.email IS NOT NULL
+      AND c.email NOT IN (
+        SELECT email FROM suppressions
+        WHERE vendor_handle = @vendorHandle OR vendor_handle IS NULL
+      )
   `;
 
   switch (audienceKey) {
-
-    case 'all':
-      return {
-        query: `
-          ${baseJoin}
-          ${baseWhere}
-        `,
-        params: { vendorHandle }
-      };
+    case 'newsletter':
+      return { query: base + `AND vs.source = 'newsletter'`, params: { vendorHandle } };
 
     case 'sms_opted_in':
-      return {
-        query: `
-          ${baseJoin}
-          ${baseWhere}
-          AND c.sms_status = 'subscribed'
-        `,
-        params: { vendorHandle }
-      };
+      return { query: base + `AND c.sms_status = 'subscribed'`, params: { vendorHandle } };
 
     case 'recent_buyers':
-      return {
-        query: `
-          ${baseJoin}
-          INNER JOIN contact_orders o
-            ON o.contact_id = c.contact_id
-            AND o.vendor_handle = @vendorHandle
-          ${baseWhere}
-          AND o.order_date >= DATEADD(day, -30, GETUTCDATE())
-        `,
-        params: { vendorHandle }
-      };
+      return { query: base + `AND c.last_order_at >= DATEADD(day, -30, GETUTCDATE())`, params: { vendorHandle } };
 
-    case 'repeat_buyers':
-      return {
-        query: `
-          ${baseJoin}
-          INNER JOIN contact_orders o
-            ON o.contact_id = c.contact_id
-            AND o.vendor_handle = @vendorHandle
-          ${baseWhere}
-          GROUP BY c.contact_id, c.email
-          HAVING COUNT(o.id) >= 2
-        `,
-        params: { vendorHandle }
-      };
+    case 'all':
+    default:
+      return { query: base, params: { vendorHandle } };
+  }
+}
 
     case 'vip':
       return {
