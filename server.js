@@ -2080,13 +2080,12 @@ app.post('/api/vendors/:handle/email/schedule',
       const claimResult = await pool.request()
         .input('now', sql.DateTimeOffset, new Date())
         .query(`
-          UPDATE scheduled_campaigns
-          SET    status = 'processing'
-          OUTPUT INSERTED.id, INSERTED.campaign_id, INSERTED.vendor_handle,
-                 INSERTED.audience, INSERTED.subject, INSERTED.preview_text,
-                 INSERTED.html_content, INSERTED.scheduled_at
-          WHERE  status     = 'pending'
-            AND  scheduled_at <= @now
+          UPDATE TOP (5) scheduled_campaigns
+          SET status = 'processing'
+          OUTPUT INSERTED.*
+          WHERE status='pending'
+          AND scheduled_at <= @now
+          ORDER BY scheduled_at;
         `);
 
       const due = claimResult.recordset;
@@ -2100,9 +2099,9 @@ app.post('/api/vendors/:handle/email/schedule',
         try {
           // Fetch audience contacts (reuse same query logic as /email/send)
           let contactsQuery = `
-            SELECT c.id AS contact_id, c.email
+            SELECT c.contact_id, c.email
             FROM   contacts c
-            JOIN   vendor_subscriptions vs ON vs.contact_id = c.id
+            JOIN   vendor_subscriptions vs ON vs.contact_id = c.contact_id
                    AND vs.vendor_handle = @handle AND vs.status = 'subscribed'
             WHERE  c.email NOT IN (SELECT email FROM suppressions)
           `;
