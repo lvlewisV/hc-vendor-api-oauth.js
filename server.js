@@ -1845,7 +1845,7 @@ app.post('/api/vendors/:handle/email/send',
   requireVendorAuth,
   async (req, res) => {
     const { handle }  = req.params;
-    const { subject, previewText, htmlContent, audience = 'all' } = req.body;
+    const { subject, previewText, htmlContent, audience = 'all', campaignName } = req.body;
     const vendorDisplayName = VENDOR_MAP[handle] || handle;
     const fromEmail = process.env.SES_FROM_EMAIL || 'hello@halfcourse.com';
     const fromName  = `${vendorDisplayName} @ HalfCourse`;
@@ -1943,18 +1943,19 @@ app.post('/api/vendors/:handle/email/send',
       try {
         await pool.request()
           .input('campaign_id',    sql.NVarChar,  campaignId)
-          .input('vendor_handle',  sql.NVarChar,  handle)
-          .input('audience',       sql.NVarChar,  audience)
-          .input('subject',        sql.NVarChar,  subject.trim())
-          .input('sent_count',     sql.Int,       sent)
-          .input('failed_count',   sql.Int,       failed)
-          .input('sent_at',        sql.DateTime2, new Date())
-          .query(`
-            INSERT INTO email_send_log
-              (campaign_id, vendor_handle, audience, subject, sent_count, failed_count, sent_at)
-            VALUES
-              (@campaign_id, @vendor_handle, @audience, @subject, @sent_count, @failed_count, @sent_at)
-          `);
+.input('vendor_handle',  sql.NVarChar,  handle)
+.input('audience',       sql.NVarChar,  audience)
+.input('campaign_name',  sql.NVarChar,  campaignName || '')
+.input('subject',        sql.NVarChar,  subject.trim())
+.input('sent_count',     sql.Int,       sent)
+.input('failed_count',   sql.Int,       failed)
+.input('sent_at',        sql.DateTime2, new Date())
+.query(`
+  INSERT INTO email_send_log
+    (campaign_id, vendor_handle, audience, campaign_name, subject, sent_count, failed_count, sent_at)
+  VALUES
+    (@campaign_id, @vendor_handle, @audience, @campaign_name, @subject, @sent_count, @failed_count, @sent_at)
+`);
       } catch (logErr) {
         console.error('[SQL] campaign log error:', logErr.message);
         // Non-fatal — don't fail the response over a logging issue
@@ -2012,7 +2013,7 @@ app.post('/api/vendors/:handle/email/schedule',
   async (req, res) => {
     try {
       const handle = req.params.handle;
-      const { subject, previewText, htmlContent, audience = 'all', scheduled_at } = req.body;
+      const { subject, previewText, htmlContent, audience = 'all', scheduled_at, campaignName } = req.body;
 
       if (!subject || !htmlContent) {
         return res.status(400).json({ error: 'subject and htmlContent are required' });
@@ -2035,18 +2036,19 @@ app.post('/api/vendors/:handle/email/schedule',
       const pool = await getPool();
       await pool.request()
         .input('campaign_id',   sql.NVarChar, campaignId)
-        .input('vendor_handle', sql.NVarChar, handle)
-        .input('audience',      sql.NVarChar, audience)
-        .input('subject',       sql.NVarChar, subject)
-        .input('preview_text',  sql.NVarChar, previewText || '')
-        .input('html_content',  sql.NVarChar(sql.MAX), htmlContent)
-        .input('scheduled_at',  sql.DateTimeOffset, scheduledDate)
-        .query(`
-          INSERT INTO scheduled_campaigns
-            (campaign_id, vendor_handle, audience, subject, preview_text, html_content, scheduled_at, status)
-          VALUES
-            (@campaign_id, @vendor_handle, @audience, @subject, @preview_text, @html_content, @scheduled_at, 'pending')
-        `);
+.input('vendor_handle', sql.NVarChar, handle)
+.input('audience',      sql.NVarChar, audience)
+.input('campaign_name', sql.NVarChar, campaignName || '')
+.input('subject',       sql.NVarChar, subject)
+.input('preview_text',  sql.NVarChar, previewText || '')
+.input('html_content',  sql.NVarChar(sql.MAX), htmlContent)
+.input('scheduled_at',  sql.DateTimeOffset, scheduledDate)
+.query(`
+  INSERT INTO scheduled_campaigns
+    (campaign_id, vendor_handle, audience, campaign_name, subject, preview_text, html_content, scheduled_at, status)
+  VALUES
+    (@campaign_id, @vendor_handle, @audience, @campaign_name, @subject, @preview_text, @html_content, @scheduled_at, 'pending')
+`);
 
       console.log(`[SCHEDULE] Campaign ${campaignId} scheduled for ${scheduledDate.toISOString()} by ${handle}`);
 
