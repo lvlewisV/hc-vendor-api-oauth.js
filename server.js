@@ -2067,6 +2067,121 @@ app.post('/api/vendors/:handle/email/schedule',
 );
 
 // =============================================================================
+// EMAIL — LIST CAMPAIGNS (sent + scheduled)
+// =============================================================================
+
+/**
+ * GET /api/vendors/:handle/email/campaigns
+ * Returns sent campaigns (email_send_log) and pending/scheduled campaigns
+ * (scheduled_campaigns) for the given vendor.
+ *
+ * Query params:
+ *   ?limit=20   (default 20, max 100)
+ *   ?offset=0
+ */
+app.get('/api/vendors/:handle/email/campaigns',
+  requireShopifyAuth,
+  requireVendorAuth,
+  async (req, res) => {
+    try {
+      const handle = req.params.handle;
+      const limit  = Math.min(parseInt(req.query.limit  || '20', 10), 100);
+      const offset = Math.max(parseInt(req.query.offset || '0',  10), 0);
+
+      const pool = await getPool();
+
+      // Sent campaigns
+      const sentResult = await pool.request()
+        .input('handle', sql.NVarChar, handle)
+        .input('limit',  sql.Int,      limit)
+        .input('offset', sql.Int,      offset)
+        .query(`
+          SELECT
+            campaign_id,
+            campaign_name,
+            subject,
+            audience,
+            sent_count,
+            failed_count,
+            sent_at,
+            'sent' AS status,
+            NULL   AS scheduled_at
+          FROM email_send_log
+          WHERE vendor_handle = @handle
+          ORDER BY sent_at DESC
+          OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
+        `);
+
+      // Scheduled / pending campaigns
+      const scheduledResult = await pool.request()
+        .input('handle', sql.NVarChar, handle)
+        .query(`
+          SELECT
+            campaign_id,
+            campaign_name,
+            subject,
+            audience,
+            sent_count,
+            failed_count,
+            sent_at,
+            status,
+            scheduled_at
+          FROM scheduled_campaigns
+          WHERE vendor_handle = @handle
+            AND status IN ('pending', 'failed')
+          ORDER BY scheduled_at ASC
+        `);
+
+      // Per-campaign open/click aggregates (from email_send_recipients)
+      const statsResult = await pool.request()
+        .input('handle', sql.NVarChar, handle)
+        .query(`
+          SELECT
+            r.campaign_id,
+            COUNT(CASE WHEN r.status = 'opened'   THEN 1 END) AS opens,
+            COUNT(CASE WHEN r.status = 'clicked'  THEN 1 END) AS clicks,
+            COUNT(CASE WHEN r.status = 'bounced'  THEN 1 END) AS bounces,
+            COUNT(*) AS total_recipients
+          FROM email_send_recipients r
+          INNER JOIN email_send_log l
+            ON r.campaign_id = l.campaign_id
+           AND l.vendor_handle = @handle
+          GROUP BY r.campaign_id
+        `);
+
+      // Map stats by campaign_id
+      const statsMap = {};
+      for (const row of statsResult.recordset) {
+        statsMap[row.campaign_id] = row;
+      }
+
+      // Merge stats into sent campaigns
+      const sent = sentResult.recordset.map(c => ({
+        ...c,
+        opens:   statsMap[c.campaign_id]?.opens   ?? 0,
+        clicks:  statsMap[c.campaign_id]?.clicks  ?? 0,
+        bounces: statsMap[c.campaign_id]?.bounces ?? 0,
+        open_rate: statsMap[c.campaign_id]?.total_recipients > 0
+          ? ((statsMap[c.campaign_id].opens / statsMap[c.campaign_id].total_recipients) * 100).toFixed(1)
+          : null,
+        click_rate: statsMap[c.campaign_id]?.total_recipients > 0
+          ? ((statsMap[c.campaign_id].clicks / statsMap[c.campaign_id].total_recipients) * 100).toFixed(1)
+          : null,
+      }));
+
+      return res.json({
+        sent,
+        scheduled: scheduledResult.recordset,
+      });
+
+    } catch (err) {
+      console.error('[Campaigns] list error:', err.message);
+      return res.status(500).json({ error: 'Internal server error: ' + err.message });
+    }
+  }
+);
+
+// =============================================================================
 // SCHEDULED CAMPAIGN RUNNER (polls every 60 s)
 // =============================================================================
 /**
