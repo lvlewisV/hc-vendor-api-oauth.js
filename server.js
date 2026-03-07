@@ -2113,23 +2113,31 @@ app.get('/api/vendors/:handle/email/campaigns',
         `);
 
       // Scheduled / pending campaigns
-      const scheduledResult = await pool.request()
-        .input('handle', sql.NVarChar, handle)
+      const schedResult = await pool.request()
+        .input('vendor_handle_sched', sql.NVarChar, handle)
         .query(`
           SELECT
-            campaign_id,
-            campaign_name,
-            subject,
-            audience,
-            sent_count,
-            failed_count,
-            sent_at,
-            status,
-            scheduled_at
+            id, campaign_name, subject, preview_text,
+            audience, status, scheduled_at, created_at, updated_at,
+            blocks_json, state_json
           FROM scheduled_campaigns
-          WHERE vendor_handle = @handle
-            AND status IN ('pending', 'failed')
+          WHERE vendor_handle = @vendor_handle_sched
+            AND status IN ('pending', 'scheduled')
           ORDER BY scheduled_at ASC
+        `);
+
+      // Draft campaigns (saved but not scheduled)
+      const draftResult = await pool.request()
+        .input('vendor_handle_draft', sql.NVarChar, handle)
+        .query(`
+          SELECT
+            id, campaign_name, subject, preview_text,
+            audience, status, created_at, updated_at,
+            blocks_json, state_json
+          FROM scheduled_campaigns
+          WHERE vendor_handle = @vendor_handle_draft
+            AND status = 'draft'
+          ORDER BY updated_at DESC
         `);
 
       // Per-campaign open/click aggregates (from email_send_recipients)
@@ -2171,12 +2179,173 @@ app.get('/api/vendors/:handle/email/campaigns',
 
       return res.json({
         sent,
-        scheduled: scheduledResult.recordset,
+        scheduled: schedResult.recordset,
+        drafts:    draftResult.recordset,
       });
 
     } catch (err) {
       console.error('[Campaigns] list error:', err.message);
       return res.status(500).json({ error: 'Internal server error: ' + err.message });
+    }
+  }
+);
+
+// =============================================================================
+// EMAIL — CANCEL / DELETE CAMPAIGN
+// =============================================================================
+
+/**
+ * DELETE /api/vendors/:handle/email/campaigns/:id
+ * - Draft (status='draft')     → hard-delete the row
+ * - Scheduled (status='pending'/'scheduled') → set status='cancelled'
+ */
+app.delete('/api/vendors/:handle/email/campaigns/:id',
+  requireShopifyAuth,
+  requireVendorAuth,
+  async (req, res) => {
+    const { handle, id } = req.params;
+    try {
+      const pool = await getPool();
+
+      // Fetch the row first to confirm it belongs to this vendor
+      const existing = await pool.request()
+        .input('id',     sql.Int,      parseInt(id))
+        .input('handle', sql.NVarChar, handle)
+        .query(`
+          SELECT id, status FROM scheduled_campaigns
+          WHERE id = @id AND vendor_handle = @handle
+        `);
+
+      if (!existing.recordset.length) {
+        return res.status(404).json({ error: 'Campaign not found' });
+      }
+
+      const status = existing.recordset[0].status;
+
+      if (status === 'draft') {
+        await pool.request()
+          .input('id',     sql.Int,      parseInt(id))
+          .input('handle', sql.NVarChar, handle)
+          .query(`
+            DELETE FROM scheduled_campaigns
+            WHERE id = @id AND vendor_handle = @handle AND status = 'draft'
+          `);
+        return res.json({ success: true, action: 'deleted' });
+      }
+
+      if (status === 'pending' || status === 'scheduled') {
+        await pool.request()
+          .input('id',     sql.Int,      parseInt(id))
+          .input('handle', sql.NVarChar, handle)
+          .query(`
+            UPDATE scheduled_campaigns
+            SET status = 'cancelled'
+            WHERE id = @id AND vendor_handle = @handle
+              AND status IN ('pending', 'scheduled')
+          `);
+        return res.json({ success: true, action: 'cancelled' });
+      }
+
+      return res.status(400).json({ error: `Cannot cancel a campaign with status '${status}'` });
+
+    } catch (err) {
+      console.error('[Campaigns] delete/cancel error:', err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// =============================================================================
+// EMAIL — SAVE DRAFT
+// =============================================================================
+
+/**
+ * POST /api/vendors/:handle/email/campaigns/draft
+ * Save (or update) an email campaign as a draft.
+ *
+ * Body: { campaign_name, subject, preview_text, blocks_json, state_json, html_content, draft_id? }
+ * draft_id — if provided, updates the existing draft instead of creating a new one.
+ *
+ * Table requirement — add these columns to scheduled_campaigns if not present:
+ *   blocks_json  NVARCHAR(MAX)   NULL
+ *   state_json   NVARCHAR(MAX)   NULL
+ *   preview_text NVARCHAR(500)   NULL
+ *   updated_at   DATETIME        NULL  DEFAULT GETDATE()
+ */
+app.post(
+  '/api/vendors/:handle/email/campaigns/draft',
+  requireShopifyAuth,
+  requireVendorAuth,
+  async (req, res) => {
+    const { handle } = req.params;
+    const {
+      campaign_name = 'Untitled Draft',
+      subject       = '',
+      preview_text  = '',
+      blocks_json   = '[]',
+      state_json    = '{}',
+      html_content  = '',
+      draft_id      = null
+    } = req.body;
+
+    try {
+      const pool = await getPool();
+
+      if (draft_id) {
+        // ── Update existing draft ──────────────────────────────
+        await pool.request()
+          .input('id',            sql.Int,                parseInt(draft_id))
+          .input('vendor_handle', sql.NVarChar,           handle)
+          .input('name',          sql.NVarChar(200),      campaign_name)
+          .input('subject',       sql.NVarChar(500),      subject)
+          .input('preview_text',  sql.NVarChar(500),      preview_text)
+          .input('blocks_json',   sql.NVarChar(sql.MAX),  blocks_json)
+          .input('state_json',    sql.NVarChar(sql.MAX),  state_json)
+          .input('html_content',  sql.NVarChar(sql.MAX),  html_content)
+          .query(`
+            UPDATE scheduled_campaigns
+            SET campaign_name = @name,
+                subject       = @subject,
+                preview_text  = @preview_text,
+                blocks_json   = @blocks_json,
+                state_json    = @state_json,
+                html_content  = @html_content,
+                updated_at    = GETDATE()
+            WHERE id = @id
+              AND vendor_handle = @vendor_handle
+              AND status = 'draft'
+          `);
+
+        return res.json({ success: true, id: parseInt(draft_id), updated: true });
+      }
+
+      // ── Insert new draft ─────────────────────────────────────
+      const result = await pool.request()
+        .input('vendor_handle', sql.NVarChar,           handle)
+        .input('name',          sql.NVarChar(200),      campaign_name)
+        .input('subject',       sql.NVarChar(500),      subject)
+        .input('preview_text',  sql.NVarChar(500),      preview_text)
+        .input('blocks_json',   sql.NVarChar(sql.MAX),  blocks_json)
+        .input('state_json',    sql.NVarChar(sql.MAX),  state_json)
+        .input('html_content',  sql.NVarChar(sql.MAX),  html_content)
+        .query(`
+          INSERT INTO scheduled_campaigns
+            (vendor_handle, campaign_name, subject, preview_text,
+             blocks_json, state_json, html_content,
+             audience, status, created_at, updated_at)
+          OUTPUT INSERTED.id
+          VALUES
+            (@vendor_handle, @name, @subject, @preview_text,
+             @blocks_json, @state_json, @html_content,
+             'draft', 'draft', GETDATE(), GETDATE())
+        `);
+
+      const newId = result.recordset[0]?.id;
+      return res.json({ success: true, id: newId, updated: false });
+
+    } catch (err) {
+      console.error('[Draft Save Error]', err);
+      return res.status(500).json({ error: err.message });
     }
   }
 );
