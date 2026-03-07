@@ -541,6 +541,40 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
 /**
  * Strips HTML tags from a string to produce a plain-text email fallback.
  */
+/**
+ * injectUtmLinks — appends UTM params to every href in an email HTML string.
+ * Skips unsubscribe links, mailto:, tel:, and anchors (#).
+ * Resolves %%placeholders%% from the provided context object.
+ */
+function injectUtmLinks(html, ctx) {
+  // Build base UTM string from context
+  const utmBase = [
+    'utm_source=halfcourse',
+    `utm_medium=email`,
+    `utm_campaign=${encodeURIComponent((ctx.campaign_name || 'campaign').toLowerCase().replace(/\s+/g, '_') + '_' + (ctx.vendor_tag || ''))}`,
+    `utm_content=${encodeURIComponent(ctx.alias || 'link')}`,
+    `smtrctid2=${encodeURIComponent(ctx.contact_id || '')}`,
+  ].join('&');
+
+  // Replace every href="..." in the HTML
+  return html.replace(/href="([^"]+)"/gi, (match, url) => {
+    // Skip unsubscribe, mailto, tel, anchors
+    if (
+      url.startsWith('#') ||
+      url.startsWith('mailto:') ||
+      url.startsWith('tel:') ||
+      url.includes('unsubscribe') ||
+      url.includes('UNSUBSCRIBE')
+    ) return match;
+
+    // Don't double-add UTM params
+    if (url.includes('utm_source=')) return match;
+
+    const sep = url.includes('?') ? '&' : '?';
+    return `href="${url}${sep}${utmBase}"`;
+  });
+}
+
 function stripHtmlToText(html) {
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -1885,11 +1919,19 @@ app.post('/api/vendors/:handle/email/send',
           const unsubUrl   = `${appUrl}/api/unsubscribe?token=${token}&vendor=${encodeURIComponent(handle)}`;
           const listUnsub  = `<${unsubUrl}>, <mailto:unsubscribe@halfcourse.com?subject=unsubscribe>`;
 
-          // Personalise HTML — inject first name if present, inject unsubscribe link
-          const personalised = htmlContent
-  .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
-  .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
-  .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl);
+          // Personalise HTML — inject first name, unsubscribe link, UTM params
+          const personalised = injectUtmLinks(
+            htmlContent
+              .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
+              .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
+              .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl),
+            {
+              campaign_name: campaignName || '',
+              vendor_tag:    handle,
+              contact_id:    contact.contact_id,
+              alias:         'body',
+            }
+          );
 
           const plainText = stripHtmlToText(personalised)
             + `\n\nTo unsubscribe: ${unsubUrl}`;
@@ -2088,27 +2130,43 @@ app.get('/api/vendors/:handle/email/campaigns',
 
       const pool = await getPool();
 
-      // Sent campaigns
+      // Sent campaigns — union scheduled_campaigns (status=sent) + email_send_log
       const sentResult = await pool.request()
         .input('handle', sql.NVarChar, handle)
         .input('limit',  sql.Int,      limit)
         .input('offset', sql.Int,      offset)
         .query(`
-          SELECT
-            campaign_name,
-            subject,
-            MIN(created_at)                                       AS sent_at,
-            COUNT(*)                                              AS sent_count,
-            COUNT(CASE WHEN status = 'failed' THEN 1 END)        AS failed_count,
-            COUNT(CASE WHEN status = 'opened'   OR
-                            status = 'delivered' THEN 1 END)     AS delivered_count,
-            'sent' AS status,
-            NULL   AS scheduled_at,
-            NULL   AS audience
-          FROM email_send_log
-          WHERE vendor_tag = @handle
-          GROUP BY campaign_name, subject
-          ORDER BY MIN(created_at) DESC
+          SELECT *
+          FROM (
+            SELECT
+              campaign_name,
+              subject,
+              COALESCE(sent_at, updated_at, created_at) AS sent_at,
+              COALESCE(sent_count, 0)   AS sent_count,
+              COALESCE(failed_count, 0) AS failed_count,
+              0                         AS delivered_count,
+              audience,
+              'sent'                    AS status
+            FROM scheduled_campaigns
+            WHERE vendor_handle = @handle
+              AND status = 'sent'
+
+            UNION ALL
+
+            SELECT
+              campaign_name,
+              subject,
+              MIN(created_at)                                             AS sent_at,
+              COUNT(*)                                                    AS sent_count,
+              COUNT(CASE WHEN status = 'failed' THEN 1 END)              AS failed_count,
+              COUNT(CASE WHEN status IN ('opened','delivered') THEN 1 END) AS delivered_count,
+              NULL    AS audience,
+              'sent'  AS status
+            FROM email_send_log
+            WHERE vendor_tag = @handle
+            GROUP BY campaign_name, subject
+          ) AS combined
+          ORDER BY sent_at DESC
           OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
         `);
 
@@ -2377,10 +2435,18 @@ app.post(
               const unsubUrl   = `${appUrl}/api/unsubscribe?token=${token}&vendor=${encodeURIComponent(vendor_handle)}`;
               const listUnsub  = `<${unsubUrl}>, <mailto:unsubscribe@halfcourse.com?subject=unsubscribe>`;
 
-              const personalised = html_content
-  .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
-  .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
-  .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl);
+              const personalised = injectUtmLinks(
+                html_content
+                  .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
+                  .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
+                  .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl),
+                {
+                  campaign_name: campaign.campaign_name || '',
+                  vendor_tag:    vendor_handle,
+                  contact_id:    contact.contact_id,
+                  alias:         'body',
+                }
+              );
 
               const sesResponse = await ses.send(new SendEmailCommand({
                 Source:      `${vendorDisplayName} @ HalfCourse <${fromEmail}>`,
