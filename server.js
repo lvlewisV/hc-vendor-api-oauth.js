@@ -459,11 +459,14 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
       AND c.global_status = 'subscribed'
       AND c.email IS NOT NULL
       AND NOT EXISTS (
-        SELECT 1
-        FROM suppressions s
-        WHERE s.email = c.email
-          AND (s.vendor_handle = @vendorHandle OR s.vendor_handle IS NULL)
-      )
+  SELECT 1
+  FROM suppressions s
+  WHERE s.contact_id = c.contact_id
+  AND (
+       s.vendor_tag = @vendorHandle
+       OR s.vendor_scope = 'global'
+  )
+)
   `;
 
   switch (audienceKey) {
@@ -1742,11 +1745,6 @@ app.post('/api/vendors/:vendor/subscribe', async (req, res) => {
           VALUES (@vendorTag, @contactId, 'subscribed', @source, GETUTCDATE(), GETUTCDATE(), GETUTCDATE());
       `);
 
-    // 4. Fire welcome automation — non-blocking, never fails the subscribe response
-    enqueueWelcomeAutomation(contactId, vendorHandle).catch(err =>
-      console.error('[Automation] Welcome enqueue failed:', err.message)
-    );
-
     console.log(`[Subscribe] ${email} → ${vendorHandle}`);
     return res.json({ success: true });
 
@@ -2763,37 +2761,42 @@ app.post("/api/sns/bounce", express.json({ type: "*/*" }), async (req, res) => {
 //
 // HOW IT WORKS
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Contact subscribes → enqueueWelcomeAutomation() inserts a pending job
-//    for step 1 only (step 2+ are chained by the worker after each send).
+// 1. A contact subscribes to a vendor → enqueueWelcomeAutomation() inserts a
+//    row into automation_jobs with status = 'pending' and scheduled_at = NOW.
 //
-// 2. Contact completes an order → enqueueAutomationJob('post_purchase') is
-//    called from the order webhook.
+// 2. A contact completes an order   → enqueueAutomationJob('post_purchase')
+//    is called from the order webhook / subscribe endpoint.
 //
-// 3. startAutomationWorker() polls every WORKER_INTERVAL_MS. Per tick it:
-//      a. Fetches the contact first (email needed for suppression check).
-//      b. Checks suppressions by email + vendor_handle.
-//      c. Looks up the vendor_emails template for that type + step.
-//         If no active template exists → marks job 'skipped'.
-//      d. Personalises and sends via SES.
+// 3. startAutomationWorker() runs every WORKER_INTERVAL_MS.  It:
+//      a. Fetches all pending jobs whose scheduled_at has passed.
+//      b. Locks each row (status = 'processing') to prevent duplicate sends.
+//      c. Looks up the vendor_email template for that type + step.
+//      d. Personalises and sends via SES (same flow as campaigns).
 //      e. Marks the job 'sent' and logs the SES MessageId.
-//      f. Chains to the next step using that template's actual delay_hours —
-//         only if an active template exists for step N+1.
+//      f. If no template exists, marks the job 'skipped'.
+//      g. On error, marks the job 'failed' so it won't loop forever.
 //
-// STEP CHAINING (why pre-enqueuing is wrong)
+// MULTI-VENDOR SAFETY
 // ─────────────────────────────────────────────────────────────────────────────
-// Pre-enqueuing step 2 at subscribe time means:
-//   • The delay is hardcoded, ignoring what the vendor set in vendor_emails.
-//   • If step 2 is skipped (no template), it's marked 'skipped' permanently
-//     and will never fire even if the vendor later creates that template.
-// Chaining solves both: the next step is only enqueued after step N sends,
-// using the real delay_hours from vendor_emails.
+// Every job row carries vendor_handle, so a contact subscribed to three
+// vendors will have three independent job rows — each gated by that vendor's
+// own email template.  No cross-vendor bleed.
+//
+// SUPPRESSION
+// ─────────────────────────────────────────────────────────────────────────────
+// Before sending, the worker checks the suppressions table (same logic as
+// campaign sends).  If the contact is suppressed the job is marked 'skipped'.
 //
 // =============================================================================
 
-const WORKER_INTERVAL_MS = 60_000;
-const WORKER_BATCH_SIZE  = 50;
+const WORKER_INTERVAL_MS  = 60_000;   // poll every 60 s
+const WORKER_BATCH_SIZE   = 50;       // max jobs per tick
 
-// ─── Enqueue a single automation job ─────────────────────────────────────────
+// ─── Helper: enqueue a single automation job ─────────────────────────────────
+/**
+ * Insert one automation_jobs row.
+ * delayHours defaults to 0 (send immediately on next worker tick).
+ */
 async function enqueueAutomationJob({
   contactId,
   vendorHandle,
@@ -2805,11 +2808,12 @@ async function enqueueAutomationJob({
   const pool = await getPool();
 
   // Deduplicate: skip if an identical pending/processing/sent job already exists
+  // (prevents double-enqueue if a webhook fires twice)
   const existing = await pool.request()
     .input('contactId',      sql.BigInt,   contactId)
-    .input('vendorHandle',   sql.NVarChar, vendorHandle)
-    .input('automationType', sql.NVarChar, automationType)
-    .input('automationStep', sql.Int,      automationStep)
+    .input('vendorHandle',   sql.NVarChar,  vendorHandle)
+    .input('automationType', sql.NVarChar,  automationType)
+    .input('automationStep', sql.Int,       automationStep)
     .query(`
       SELECT 1 FROM automation_jobs
       WHERE contact_id      = @contactId
@@ -2828,11 +2832,11 @@ async function enqueueAutomationJob({
 
   const result = await pool.request()
     .input('contactId',      sql.BigInt,   contactId)
-    .input('vendorHandle',   sql.NVarChar, vendorHandle)
-    .input('automationType', sql.NVarChar, automationType)
-    .input('automationStep', sql.Int,      automationStep)
+    .input('vendorHandle',   sql.NVarChar,  vendorHandle)
+    .input('automationType', sql.NVarChar,  automationType)
+    .input('automationStep', sql.Int,       automationStep)
     .input('scheduledAt',    sql.DateTime2, scheduledAt)
-    .input('jobData',        sql.NVarChar, jobData ? JSON.stringify(jobData) : null)
+    .input('jobData',        sql.NVarChar,  jobData ? JSON.stringify(jobData) : null)
     .query(`
       INSERT INTO automation_jobs
         (contact_id, vendor_handle, automation_type, automation_step, scheduled_at, status, job_data)
@@ -2846,14 +2850,25 @@ async function enqueueAutomationJob({
   return jobId;
 }
 
-// ─── Welcome: enqueue step 1 only. Steps 2+ are chained by the worker. ───────
+// ─── Convenience: welcome sequence (step 1 only — extend for multi-step) ─────
 async function enqueueWelcomeAutomation(contactId, vendorHandle) {
+  // Step 1 — immediate
   await enqueueAutomationJob({
     contactId,
     vendorHandle,
     automationType: 'welcome',
     automationStep: 1,
     delayHours: 0,
+  });
+
+  // Step 2 — 3 days later (only enqueued if vendor has created a step-2 template)
+  // The worker will silently skip if no template exists, so this is safe.
+  await enqueueAutomationJob({
+    contactId,
+    vendorHandle,
+    automationType: 'welcome',
+    automationStep: 2,
+    delayHours: 72,
   });
 }
 
@@ -2867,9 +2882,9 @@ async function processAutomationJobs() {
     return;
   }
 
+  // Fetch and atomically lock a batch of due pending jobs
   let jobs;
   try {
-    // Atomically lock a batch of due pending jobs
     const result = await pool.request()
       .input('batchSize', sql.Int, WORKER_BATCH_SIZE)
       .query(`
@@ -2905,7 +2920,22 @@ async function processSingleJob(pool, job) {
   const tag = `[AutoWorker job=${job_id} ${automation_type}#${automation_step} vendor=${vendor_handle}]`;
 
   try {
-    // ── 1. Fetch contact first (email is needed for the suppression check) ──
+    // 1. Check suppression
+    const suppressed = await pool.request()
+      .input('contactId',    sql.BigInt,  contact_id)
+      .input('vendorHandle', sql.NVarChar, vendor_handle)
+      .query(`
+        SELECT 1 FROM suppressions s
+        WHERE s.contact_id = @contactId
+          AND (s.vendor_tag = @vendorHandle OR s.vendor_scope = 'global')
+      `);
+
+    if (suppressed.recordset.length > 0) {
+      console.log(`${tag} Contact suppressed — skipping`);
+      return await markJob(pool, job_id, 'skipped');
+    }
+
+    // 2. Fetch contact
     const contactResult = await pool.request()
       .input('contactId', sql.BigInt, contact_id)
       .query(`
@@ -2922,28 +2952,13 @@ async function processSingleJob(pool, job) {
 
     const contact = contactResult.recordset[0];
 
-    // ── 2. Check suppression by email + vendor_handle ────────────────────────
-    const suppressed = await pool.request()
-      .input('email',        sql.NVarChar, contact.email)
-      .input('vendorHandle', sql.NVarChar, vendor_handle)
-      .query(`
-        SELECT 1 FROM suppressions
-        WHERE email = @email
-          AND (vendor_handle = @vendorHandle OR vendor_handle IS NULL)
-      `);
-
-    if (suppressed.recordset.length > 0) {
-      console.log(`${tag} Contact suppressed — skipping`);
-      return await markJob(pool, job_id, 'skipped');
-    }
-
-    // ── 3. Fetch the vendor's email template for this type + step ────────────
+    // 3. Fetch email template
     const templateResult = await pool.request()
       .input('vendorHandle',   sql.NVarChar, vendor_handle)
       .input('automationType', sql.NVarChar, automation_type)
       .input('automationStep', sql.Int,      automation_step)
       .query(`
-        SELECT email_id, subject, html_content, delay_hours
+        SELECT email_id, subject, html_content
         FROM vendor_emails
         WHERE vendor_handle   = @vendorHandle
           AND automation_type = @automationType
@@ -2958,18 +2973,18 @@ async function processSingleJob(pool, job) {
 
     const template = templateResult.recordset[0];
 
-    // ── 4. Personalise content ───────────────────────────────────────────────
+    // 4. Personalise content
     const unsubToken  = signUnsubscribeToken(contact.email);
     const unsubUrl    = `${APP_URL}/api/unsubscribe?token=${unsubToken}&vendor=${vendor_handle}`;
     const fromAddress = process.env.SES_FROM_EMAIL || 'noreply@halfcourse.com';
 
     const personalize = (str) =>
       (str || '')
-        .replace(/\{\{first_name\}\}/gi,      contact.first_name || 'Friend')
-        .replace(/\{\{last_name\}\}/gi,       contact.last_name  || '')
-        .replace(/\{\{email\}\}/gi,           contact.email)
+        .replace(/\{\{first_name\}\}/gi,     contact.first_name || 'Friend')
+        .replace(/\{\{last_name\}\}/gi,      contact.last_name  || '')
+        .replace(/\{\{email\}\}/gi,          contact.email)
         .replace(/\{\{unsubscribe_url\}\}/gi, unsubUrl)
-        .replace(/\{\{vendor_handle\}\}/gi,   vendor_handle);
+        .replace(/\{\{vendor_handle\}\}/gi,  vendor_handle);
 
     const subject     = personalize(template.subject);
     const htmlContent = injectUtmLinks(personalize(template.html_content), {
@@ -2980,7 +2995,7 @@ async function processSingleJob(pool, job) {
     });
     const textContent = stripHtmlToText(htmlContent);
 
-    // ── 5. Send via SES ──────────────────────────────────────────────────────
+    // 5. Send via SES
     const sesResult = await ses.send(new SendEmailCommand({
       Source:      fromAddress,
       Destination: { ToAddresses: [contact.email] },
@@ -3007,10 +3022,10 @@ async function processSingleJob(pool, job) {
     const sesMessageId = sesResult.MessageId || null;
     console.log(`${tag} Sent to ${contact.email} SES MessageId=${sesMessageId}`);
 
-    // ── 6. Mark job sent ─────────────────────────────────────────────────────
+    // 6. Mark job sent + log to email_send_recipients
     await pool.request()
-      .input('jobId',     sql.Int,      job_id)
-      .input('messageId', sql.NVarChar, sesMessageId)
+      .input('jobId',        sql.Int,      job_id)
+      .input('messageId',    sql.NVarChar, sesMessageId)
       .query(`
         UPDATE automation_jobs
         SET status       = 'sent',
@@ -3024,10 +3039,10 @@ async function processSingleJob(pool, job) {
     try {
       const campaignId = `auto_${vendor_handle}_${automation_type}_${automation_step}_${job_id}`;
       await pool.request()
-        .input('campaignId',   sql.NVarChar, campaignId)
-        .input('contactId',    sql.Int,      contact_id)
-        .input('email',        sql.NVarChar, contact.email)
-        .input('sesMessageId', sql.NVarChar, sesMessageId)
+        .input('campaignId',  sql.NVarChar, campaignId)
+        .input('contactId',   sql.Int,      contact_id)
+        .input('email',       sql.NVarChar, contact.email)
+        .input('sesMessageId',sql.NVarChar, sesMessageId)
         .query(`
           INSERT INTO email_send_recipients (campaign_id, contact_id, email, ses_message_id, status)
           VALUES (@campaignId, @contactId, @email, @sesMessageId, 'sent')
@@ -3036,7 +3051,7 @@ async function processSingleJob(pool, job) {
       console.error(`${tag} Failed to log email_send_recipients:`, recipErr.message);
     }
 
-    // ── 7. Update welcome_email_sent flag if this is welcome step 1 ─────────
+    // 7. Update vendor_subscriptions.welcome_email_sent if this is welcome step 1
     if (automation_type === 'welcome' && automation_step === 1) {
       try {
         await pool.request()
@@ -3051,40 +3066,6 @@ async function processSingleJob(pool, job) {
       } catch (wsErr) {
         console.error(`${tag} Failed to set welcome_email_sent:`, wsErr.message);
       }
-    }
-
-    // ── 8. Chain to next step using vendor's configured delay_hours ──────────
-    // Only enqueued if the vendor has created an active template for step N+1.
-    // This means delay is always pulled from the template the vendor wrote,
-    // and steps can only fire for steps the vendor has actually configured.
-    const nextStep = automation_step + 1;
-    try {
-      const nextTemplate = await pool.request()
-        .input('vendorHandle',   sql.NVarChar, vendor_handle)
-        .input('automationType', sql.NVarChar, automation_type)
-        .input('automationStep', sql.Int,      nextStep)
-        .query(`
-          SELECT delay_hours FROM vendor_emails
-          WHERE vendor_handle   = @vendorHandle
-            AND automation_type = @automationType
-            AND automation_step = @automationStep
-            AND active          = 1
-        `);
-
-      if (nextTemplate.recordset.length > 0) {
-        const nextDelay = nextTemplate.recordset[0].delay_hours || 0;
-        await enqueueAutomationJob({
-          contactId:      contact_id,
-          vendorHandle:   vendor_handle,
-          automationType: automation_type,
-          automationStep: nextStep,
-          delayHours:     nextDelay,
-        });
-        console.log(`${tag} Chained → step ${nextStep} in ${nextDelay}h`);
-      }
-    } catch (chainErr) {
-      // Non-fatal — the send already succeeded
-      console.error(`${tag} Step chaining error:`, chainErr.message);
     }
 
   } catch (err) {
@@ -3108,11 +3089,13 @@ async function markJob(pool, jobId, status) {
   }
 }
 
+// Start the worker after a short delay to let the SQL pool warm up
 setTimeout(() => {
   console.log(`[AutoWorker] Started — polling every ${WORKER_INTERVAL_MS / 1000}s`);
   setInterval(processAutomationJobs, WORKER_INTERVAL_MS);
-  processAutomationJobs();
+  processAutomationJobs(); // run once immediately
 }, 5_000);
+
 
 // =============================================================================
 // ROUTES: AUTOMATION EMAIL TEMPLATES (vendor-authenticated)
@@ -3144,6 +3127,7 @@ app.get('/api/vendors/:handle/automations/emails', requireVendorAuth, async (req
 /**
  * POST /api/vendors/:handle/automations/emails
  * Create a new automation email template.
+ * Body: { automation_type, automation_step, delay_hours, subject, html_content }
  */
 app.post('/api/vendors/:handle/automations/emails', requireVendorAuth, async (req, res) => {
   const { automation_type, automation_step = 1, delay_hours = 0, subject, html_content } = req.body;
@@ -3186,6 +3170,7 @@ app.post('/api/vendors/:handle/automations/emails', requireVendorAuth, async (re
 /**
  * PUT /api/vendors/:handle/automations/emails/:emailId
  * Update an existing automation email template.
+ * Body: { subject?, html_content?, delay_hours?, active? }
  */
 app.put('/api/vendors/:handle/automations/emails/:emailId', requireVendorAuth, async (req, res) => {
   const emailId = parseInt(req.params.emailId, 10);
@@ -3208,22 +3193,23 @@ app.put('/api/vendors/:handle/automations/emails/:emailId', requireVendorAuth, a
       return res.status(404).json({ error: 'Template not found' });
     }
 
+    // Build dynamic SET clause
     const sets   = ['updated_at = GETUTCDATE()'];
     const inputs = {};
 
-    if (subject      !== undefined) { sets.push('subject = @subject');           inputs.subject      = subject; }
-    if (html_content !== undefined) { sets.push('html_content = @htmlContent');  inputs.htmlContent  = html_content; }
-    if (delay_hours  !== undefined) { sets.push('delay_hours = @delayHours');    inputs.delayHours   = delay_hours; }
-    if (active       !== undefined) { sets.push('active = @active');             inputs.active       = active ? 1 : 0; }
+    if (subject        !== undefined) { sets.push('subject = @subject');               inputs.subject        = subject; }
+    if (html_content   !== undefined) { sets.push('html_content = @htmlContent');       inputs.htmlContent    = html_content; }
+    if (delay_hours    !== undefined) { sets.push('delay_hours = @delayHours');         inputs.delayHours     = delay_hours; }
+    if (active         !== undefined) { sets.push('active = @active');                  inputs.active         = active ? 1 : 0; }
 
     const request = pool.request()
       .input('emailId',      sql.Int,      emailId)
       .input('vendorHandle', sql.NVarChar, req.params.handle);
 
-    if (inputs.subject     !== undefined) request.input('subject',     sql.NVarChar, inputs.subject);
-    if (inputs.htmlContent !== undefined) request.input('htmlContent', sql.NVarChar, inputs.htmlContent);
-    if (inputs.delayHours  !== undefined) request.input('delayHours',  sql.Int,      inputs.delayHours);
-    if (inputs.active      !== undefined) request.input('active',      sql.Bit,      inputs.active);
+    if (inputs.subject     !== undefined) request.input('subject',      sql.NVarChar, inputs.subject);
+    if (inputs.htmlContent !== undefined) request.input('htmlContent',  sql.NVarChar, inputs.htmlContent);
+    if (inputs.delayHours  !== undefined) request.input('delayHours',   sql.Int,      inputs.delayHours);
+    if (inputs.active      !== undefined) request.input('active',       sql.Bit,      inputs.active);
 
     const updated = await request.query(`
       UPDATE vendor_emails
@@ -3268,7 +3254,8 @@ app.delete('/api/vendors/:handle/automations/emails/:emailId', requireVendorAuth
 
 /**
  * GET /api/vendors/:handle/automations/jobs
- * Recent job history (last 100 rows). Optional: ?type=welcome&status=sent
+ * Recent job history for the vendor dashboard (last 100 rows, newest first).
+ * Optional query param: ?type=welcome&status=sent
  */
 app.get('/api/vendors/:handle/automations/jobs', requireVendorAuth, async (req, res) => {
   const { type, status } = req.query;
@@ -3306,7 +3293,7 @@ app.get('/api/vendors/:handle/automations/jobs', requireVendorAuth, async (req, 
 
 /**
  * GET /api/vendors/:handle/automations/stats
- * Aggregate counts per automation type for dashboard summary cards.
+ * Aggregate counts per automation type for the dashboard summary cards.
  */
 app.get('/api/vendors/:handle/automations/stats', requireVendorAuth, async (req, res) => {
   try {
@@ -3316,11 +3303,11 @@ app.get('/api/vendors/:handle/automations/stats', requireVendorAuth, async (req,
       .query(`
         SELECT
           automation_type,
-          COUNT(*)                                                 AS total,
-          SUM(CASE WHEN status = 'sent'    THEN 1 ELSE 0 END)    AS sent,
-          SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)    AS pending,
-          SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END)    AS skipped,
-          SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END)    AS failed
+          COUNT(*)                                               AS total,
+          SUM(CASE WHEN status = 'sent'       THEN 1 ELSE 0 END) AS sent,
+          SUM(CASE WHEN status = 'pending'    THEN 1 ELSE 0 END) AS pending,
+          SUM(CASE WHEN status = 'skipped'    THEN 1 ELSE 0 END) AS skipped,
+          SUM(CASE WHEN status = 'failed'     THEN 1 ELSE 0 END) AS failed
         FROM automation_jobs
         WHERE vendor_handle = @vendorHandle
         GROUP BY automation_type
@@ -3336,6 +3323,8 @@ app.get('/api/vendors/:handle/automations/stats', requireVendorAuth, async (req,
  * POST /api/vendors/:handle/automations/enqueue
  * Manually enqueue a job — useful for testing or admin re-triggers.
  * Body: { contact_id, automation_type, automation_step?, delay_hours? }
+ *
+ * Also called internally from the subscription endpoint.
  */
 app.post('/api/vendors/:handle/automations/enqueue', requireVendorAuth, async (req, res) => {
   const { contact_id, automation_type, automation_step = 1, delay_hours = 0 } = req.body;
@@ -3363,6 +3352,30 @@ app.post('/api/vendors/:handle/automations/enqueue', requireVendorAuth, async (r
     res.status(500).json({ error: 'Failed to enqueue job' });
   }
 });
+
+// =============================================================================
+// HOOK: call enqueueWelcomeAutomation from the subscribe endpoint
+// =============================================================================
+//
+// Find the section in server.js where a new vendor_subscriptions row is
+// inserted (typically after `INSERT INTO vendor_subscriptions …`) and add:
+//
+//   enqueueWelcomeAutomation(contactId, vendorHandle).catch(err =>
+//     console.error('[Automation] Welcome enqueue failed:', err.message)
+//   );
+//
+// The call is fire-and-forget (.catch) so it never blocks the subscribe
+// response.  The same pattern applies for post_purchase:
+//
+//   enqueueAutomationJob({
+//     contactId, vendorHandle,
+//     automationType: 'post_purchase',
+//     automationStep: 1,
+//     delayHours: 1,   // 1 hour after purchase
+//   }).catch(console.error);
+//
+// =============================================================================
+
 
 // =============================================================================
 // ERROR HANDLING
