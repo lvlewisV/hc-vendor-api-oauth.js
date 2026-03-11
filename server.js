@@ -459,14 +459,10 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
       AND c.global_status = 'subscribed'
       AND c.email IS NOT NULL
       AND NOT EXISTS (
-  SELECT 1
-  FROM suppressions s
-  WHERE s.contact_id = c.contact_id
-  AND (
-       s.vendor_tag = @vendorHandle
-       OR s.vendor_scope = 'global'
-  )
-)
+        SELECT 1 FROM suppressions s
+        WHERE s.email = c.email
+          AND (s.vendor_handle = @vendorHandle OR s.vendor_handle IS NULL)
+      )
   `;
 
   switch (audienceKey) {
