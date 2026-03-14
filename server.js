@@ -459,7 +459,8 @@ function buildAudienceQuery(audienceKey, vendorHandle) {
       AND c.global_status = 'subscribed'
       AND c.email IS NOT NULL
       AND NOT EXISTS (
-        SELECT 1 FROM suppressions s
+        SELECT 1
+        FROM suppressions s
         WHERE s.contact_id = c.contact_id
           AND (s.vendor_tag = @vendorHandle OR s.vendor_scope = 'global')
       )
@@ -2579,9 +2580,9 @@ app.get("/api/unsubscribe", async (req, res) => {
       .input("vendorHandle", sql.NVarChar, vendor || null)
       .input("reason",       sql.NVarChar, "unsubscribe")
       .query(`
-        IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email AND (vendor_handle = @vendorHandle OR vendor_handle IS NULL))
-          INSERT INTO suppressions (email, vendor_handle, reason, created_at)
-          VALUES (@email, @vendorHandle, @reason, GETUTCDATE())
+        IF NOT EXISTS (SELECT 1 FROM suppressions WHERE contact_id = (SELECT contact_id FROM contacts WHERE email = @email) AND (vendor_tag = @vendorHandle OR vendor_scope = 'global'))
+          INSERT INTO suppressions (contact_id, vendor_tag, suppression_type, reason, created_at)
+          VALUES ((SELECT contact_id FROM contacts WHERE email = @email), @vendorHandle, 'email', @reason, GETUTCDATE())
       `);
     await pool.request()
       .input("email",        sql.NVarChar, email)
@@ -2618,9 +2619,9 @@ app.post("/api/unsubscribe", express.urlencoded({ extended: false }), async (req
       .input("vendorHandle", sql.NVarChar, vendor || null)
       .input("reason",       sql.NVarChar, "unsubscribe")
       .query(`
-        IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email AND (vendor_handle = @vendorHandle OR vendor_handle IS NULL))
-          INSERT INTO suppressions (email, vendor_handle, reason, created_at)
-          VALUES (@email, @vendorHandle, @reason, GETUTCDATE())
+        IF NOT EXISTS (SELECT 1 FROM suppressions WHERE contact_id = (SELECT contact_id FROM contacts WHERE email = @email) AND (vendor_tag = @vendorHandle OR vendor_scope = 'global'))
+          INSERT INTO suppressions (contact_id, vendor_tag, suppression_type, reason, created_at)
+          VALUES ((SELECT contact_id FROM contacts WHERE email = @email), @vendorHandle, 'email', @reason, GETUTCDATE())
       `);
     await pool.request()
       .input("email",        sql.NVarChar, email)
@@ -2695,10 +2696,11 @@ app.post("/api/sns/bounce", express.json({ type: "*/*" }), async (req, res) => {
           await pool.request()
             .input("email",  sql.NVarChar, r.emailAddress)
             .input("reason", sql.NVarChar, "hard_bounce")
+            .input("vendorHandle", sql.NVarChar, null)
             .query(`
-              IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email)
-                INSERT INTO suppressions (email, vendor_handle, reason, created_at)
-                VALUES (@email, NULL, @reason, GETUTCDATE())
+             IF NOT EXISTS (SELECT 1 FROM suppressions WHERE contact_id = (SELECT contact_id FROM contacts WHERE email = @email) AND (vendor_tag = @vendorHandle OR vendor_scope = 'global'))
+          INSERT INTO suppressions (contact_id, vendor_tag, suppression_type, reason, created_at)
+          VALUES ((SELECT contact_id FROM contacts WHERE email = @email), @vendorHandle, 'email', @reason, GETUTCDATE())
             `);
           console.log(`[SNS] Hard bounce suppressed: ${r.emailAddress}`);
         } else {
@@ -2717,9 +2719,9 @@ app.post("/api/sns/bounce", express.json({ type: "*/*" }), async (req, res) => {
           .input("email",  sql.NVarChar, r.emailAddress)
           .input("reason", sql.NVarChar, "complaint")
           .query(`
-            IF NOT EXISTS (SELECT 1 FROM suppressions WHERE email = @email)
-              INSERT INTO suppressions (email, vendor_handle, reason, created_at)
-              VALUES (@email, NULL, @reason, GETUTCDATE())
+            IF NOT EXISTS (SELECT 1 FROM suppressions WHERE contact_id = (SELECT contact_id FROM contacts WHERE email = @email) AND vendor_scope = 'global')
+          INSERT INTO suppressions (contact_id, vendor_tag, suppression_type, reason, created_at)
+          VALUES ((SELECT contact_id FROM contacts WHERE email = @email), NULL, 'email', @reason, GETUTCDATE())
           `);
         console.log(`[SNS] Complaint suppressed: ${r.emailAddress}`);
       }
@@ -2923,12 +2925,12 @@ async function processSingleJob(pool, job) {
 
     // ── 2. Check suppression by email + vendor_handle ────────────────────────
     const suppressed = await pool.request()
-      .input('email',        sql.NVarChar, contact.email)
+      .input('contactId',    sql.BigInt,   contact_id)
       .input('vendorHandle', sql.NVarChar, vendor_handle)
       .query(`
-        SELECT 1 FROM suppressions
-        WHERE email = @email
-          AND (vendor_handle = @vendorHandle OR vendor_handle IS NULL)
+       SELECT 1 FROM suppressions
+        WHERE contact_id = @contactId
+          AND (vendor_tag = @vendorHandle OR vendor_scope = 'global')
       `);
 
     if (suppressed.recordset.length > 0) {
