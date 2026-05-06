@@ -2204,7 +2204,6 @@ app.get('/api/vendors/:handle/email/campaigns',
       }
 
       // ── Draft campaigns ────────────────────────────────────────────────────
-      // Uses COL_LENGTH() to safely check for columns added after the initial DDL.
       try {
         const draftResult = await pool.request()
           .input('vendor_handle_draft', sql.NVarChar, handle)
@@ -2213,17 +2212,12 @@ app.get('/api/vendors/:handle/email/campaigns',
               id,
               COALESCE(campaign_name, campaign_id, '(Unnamed)') AS campaign_name,
               subject, preview_text,
-              audience, status, created_at,
-              CASE WHEN COL_LENGTH('scheduled_campaigns','updated_at')  IS NOT NULL
-                   THEN CAST(updated_at AS NVARCHAR(50)) END AS updated_at,
-              CASE WHEN COL_LENGTH('scheduled_campaigns','blocks_json') IS NOT NULL
-                   THEN blocks_json END AS blocks_json,
-              CASE WHEN COL_LENGTH('scheduled_campaigns','state_json')  IS NOT NULL
-                   THEN state_json  END AS state_json
+              audience, status, created_at, updated_at,
+              blocks_json, state_json
             FROM scheduled_campaigns
             WHERE vendor_handle = @vendor_handle_draft
               AND status = 'draft'
-            ORDER BY created_at DESC
+            ORDER BY COALESCE(updated_at, created_at) DESC
           `);
         drafts = draftResult.recordset;
       } catch (draftErr) {
