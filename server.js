@@ -572,6 +572,33 @@ function injectUtmLinks(html, ctx) {
   });
 }
 
+/**
+ * resolveTemplateTags — handles [[ contact.FIELD | default: 'fallback' ]] syntax.
+ * Replaces any [[ contact.X ]] tag with the matching field from the contact object,
+ * falling back to the default value if the field is empty or missing.
+ * Supports both [[ ]] and {{ }} delimiters for contact fields.
+ */
+function resolveTemplateTags(html, contact) {
+  if (!html) return html;
+  // Handle [[ contact.field | default: 'fallback' ]] — single or double quotes
+  html = html.replace(/\[\[\s*contact\.(\w+)\s*(?:\|\s*default:\s*['"]([^'"]*)['"]\s*)?\]\]/g,
+    (match, field, fallback) => {
+      const val = contact[field];
+      return (val !== null && val !== undefined && String(val).trim() !== '')
+        ? String(val) : (fallback || '');
+    }
+  );
+  // Handle {{ contact.field | default: 'fallback' }} — same pattern, different delimiters
+  html = html.replace(/\{\{\s*contact\.(\w+)\s*(?:\|\s*default:\s*['"]([^'"]*)['"]\s*)?\}\}/g,
+    (match, field, fallback) => {
+      const val = contact[field];
+      return (val !== null && val !== undefined && String(val).trim() !== '')
+        ? String(val) : (fallback || '');
+    }
+  );
+  return html;
+}
+
 function stripHtmlToText(html) {
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -1900,7 +1927,8 @@ app.post('/api/vendors/:handle/email/send',
       const result = await pool.request()
         .input('vendorHandle', sql.NVarChar, handle)
         .query(`
-  SELECT DISTINCT c.contact_id, c.email, c.first_name
+  SELECT DISTINCT c.contact_id, c.email, c.first_name, c.last_name,
+                  c.city, c.state, c.zip, c.phone
   ${query}
 `);
 
@@ -1923,10 +1951,13 @@ app.post('/api/vendors/:handle/email/send',
 
           // Personalise HTML — inject first name, unsubscribe link, UTM params
           const personalised = injectUtmLinks(
-            htmlContent
-              .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
-              .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
-              .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl),
+            resolveTemplateTags(
+              htmlContent
+                .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
+                .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
+                .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl),
+              contact
+            ),
             {
               campaign_name: campaignName || '',
               vendor_tag:    handle,
@@ -2436,7 +2467,7 @@ app.post(
           const { query } = buildAudienceQuery(audience, vendor_handle);
           const contacts = (await pool.request()
             .input('vendorHandle', sql.NVarChar, vendor_handle)
-            .query(`SELECT DISTINCT c.contact_id, c.email, c.first_name ${query}`)
+            .query(`SELECT DISTINCT c.contact_id, c.email, c.first_name, c.last_name, c.city, c.state, c.zip, c.phone ${query}`)
           ).recordset;
 
           if (!contacts.length) {
@@ -2458,10 +2489,13 @@ app.post(
               const listUnsub  = `<${unsubUrl}>, <mailto:unsubscribe@halfcourse.com?subject=unsubscribe>`;
 
               const personalised = injectUtmLinks(
-                html_content
-                  .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
-                  .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
-                  .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl),
+                resolveTemplateTags(
+                  html_content
+                    .replace(/{{\s*first_name\s*}}/gi, contact.first_name || 'there')
+                    .replace(/{{\s*unsubscribe_url\s*}}/gi, unsubUrl)
+                    .replace(/UNSUBSCRIBE_LINK/gi, unsubUrl),
+                  contact
+                ),
                 {
                   campaign_name: campaign.campaign_name || '',
                   vendor_tag:    vendor_handle,
@@ -2993,7 +3027,7 @@ async function processSingleJob(pool, job) {
         .replace(/\{\{vendor_handle\}\}/gi,   vendor_handle);
 
     const subject     = personalize(template.subject);
-    const htmlContent = injectUtmLinks(personalize(template.html_content), {
+    const htmlContent = injectUtmLinks(resolveTemplateTags(personalize(template.html_content), contact), {
       campaign_name: `${automation_type}_step${automation_step}`,
       vendor_tag:    vendor_handle,
       contact_id:    contact_id,
