@@ -2132,79 +2132,105 @@ app.get('/api/vendors/:handle/email/campaigns',
 
       const pool = await getPool();
 
-      // Sent campaigns — union scheduled_campaigns (status=sent) + email_send_log
-      const sentResult = await pool.request()
-        .input('handle', sql.NVarChar, handle)
-        .input('limit',  sql.Int,      limit)
-        .input('offset', sql.Int,      offset)
-        .query(`
-          SELECT *
-          FROM (
+      // Run each query independently — one failure will not prevent the others from returning data
+      let sent = [], scheduled = [], drafts = [];
+
+      // ── Sent campaigns ─────────────────────────────────────────────────────
+      // Uses only columns guaranteed in the original DDL (no updated_at reference).
+      try {
+        const sentResult = await pool.request()
+          .input('handle', sql.NVarChar, handle)
+          .input('limit',  sql.Int,      limit)
+          .input('offset', sql.Int,      offset)
+          .query(`
+            SELECT *
+            FROM (
+              -- Campaigns sent via the scheduler
+              SELECT
+                COALESCE(campaign_name, campaign_id, '(Unnamed)') AS campaign_name,
+                subject,
+                COALESCE(sent_at, created_at)      AS sent_at,
+                COALESCE(sent_count, 0)             AS sent_count,
+                COALESCE(failed_count, 0)           AS failed_count,
+                0                                   AS delivered_count,
+                audience,
+                'sent'                              AS status
+              FROM scheduled_campaigns
+              WHERE vendor_handle = @handle
+                AND status = 'sent'
+
+              UNION ALL
+
+              -- Campaigns logged to email_send_log (immediate sends)
+              SELECT
+                COALESCE(campaign_name, '(Unnamed)') AS campaign_name,
+                subject,
+                MIN(created_at)                                              AS sent_at,
+                COUNT(*)                                                     AS sent_count,
+                COUNT(CASE WHEN status = 'failed' THEN 1 END)               AS failed_count,
+                COUNT(CASE WHEN status IN ('opened','delivered') THEN 1 END) AS delivered_count,
+                NULL   AS audience,
+                'sent' AS status
+              FROM email_send_log
+              WHERE vendor_tag = @handle
+              GROUP BY campaign_name, subject
+            ) AS combined
+            ORDER BY sent_at DESC
+            OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
+          `);
+        sent = sentResult.recordset;
+      } catch (sentErr) {
+        console.error('[Campaigns] sent query error:', sentErr.message);
+      }
+
+      // ── Scheduled / pending campaigns ──────────────────────────────────────
+      try {
+        const schedResult = await pool.request()
+          .input('vendor_handle_sched', sql.NVarChar, handle)
+          .query(`
             SELECT
-              campaign_name,
-              subject,
-              COALESCE(sent_at, updated_at, created_at) AS sent_at,
-              COALESCE(sent_count, 0)   AS sent_count,
-              COALESCE(failed_count, 0) AS failed_count,
-              0                         AS delivered_count,
-              audience,
-              'sent'                    AS status
+              id,
+              COALESCE(campaign_name, campaign_id, '(Unnamed)') AS campaign_name,
+              subject, preview_text,
+              audience, status, scheduled_at, created_at
             FROM scheduled_campaigns
-            WHERE vendor_handle = @handle
-              AND status = 'sent'
+            WHERE vendor_handle = @vendor_handle_sched
+              AND status IN ('pending', 'scheduled')
+            ORDER BY scheduled_at ASC
+          `);
+        scheduled = schedResult.recordset;
+      } catch (schedErr) {
+        console.error('[Campaigns] sched query error:', schedErr.message);
+      }
 
-            UNION ALL
-
+      // ── Draft campaigns ────────────────────────────────────────────────────
+      // Uses COL_LENGTH() to safely check for columns added after the initial DDL.
+      try {
+        const draftResult = await pool.request()
+          .input('vendor_handle_draft', sql.NVarChar, handle)
+          .query(`
             SELECT
-              campaign_name,
-              subject,
-              MIN(created_at)                                             AS sent_at,
-              COUNT(*)                                                    AS sent_count,
-              COUNT(CASE WHEN status = 'failed' THEN 1 END)              AS failed_count,
-              COUNT(CASE WHEN status IN ('opened','delivered') THEN 1 END) AS delivered_count,
-              NULL    AS audience,
-              'sent'  AS status
-            FROM email_send_log
-            WHERE vendor_tag = @handle
-            GROUP BY campaign_name, subject
-          ) AS combined
-          ORDER BY sent_at DESC
-          OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
-        `);
+              id,
+              COALESCE(campaign_name, campaign_id, '(Unnamed)') AS campaign_name,
+              subject, preview_text,
+              audience, status, created_at,
+              CASE WHEN COL_LENGTH('scheduled_campaigns','updated_at')  IS NOT NULL
+                   THEN CAST(updated_at AS NVARCHAR(50)) END AS updated_at,
+              CASE WHEN COL_LENGTH('scheduled_campaigns','blocks_json') IS NOT NULL
+                   THEN blocks_json END AS blocks_json,
+              CASE WHEN COL_LENGTH('scheduled_campaigns','state_json')  IS NOT NULL
+                   THEN state_json  END AS state_json
+            FROM scheduled_campaigns
+            WHERE vendor_handle = @vendor_handle_draft
+              AND status = 'draft'
+            ORDER BY created_at DESC
+          `);
+        drafts = draftResult.recordset;
+      } catch (draftErr) {
+        console.error('[Campaigns] draft query error:', draftErr.message);
+      }
 
-      // Scheduled / pending campaigns
-      const schedResult = await pool.request()
-        .input('vendor_handle_sched', sql.NVarChar, handle)
-        .query(`
-          SELECT
-            id, campaign_name, subject, preview_text,
-            audience, status, scheduled_at, created_at, updated_at,
-            blocks_json, state_json
-          FROM scheduled_campaigns
-          WHERE vendor_handle = @vendor_handle_sched
-            AND status IN ('pending', 'scheduled')
-          ORDER BY scheduled_at ASC
-        `);
-
-      // Draft campaigns (saved but not scheduled)
-      const draftResult = await pool.request()
-        .input('vendor_handle_draft', sql.NVarChar, handle)
-        .query(`
-          SELECT
-            id, campaign_name, subject, preview_text,
-            audience, status, created_at, updated_at,
-            blocks_json, state_json
-          FROM scheduled_campaigns
-          WHERE vendor_handle = @vendor_handle_draft
-            AND status = 'draft'
-          ORDER BY updated_at DESC
-        `);
-
-      return res.json({
-        sent:      sentResult.recordset,
-        scheduled: schedResult.recordset,
-        drafts:    draftResult.recordset,
-      });
+      return res.json({ sent, scheduled, drafts });
 
     } catch (err) {
       console.error('[Campaigns] list error:', err.message);
