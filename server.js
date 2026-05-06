@@ -2592,14 +2592,19 @@ app.post("/api/vendors/:vendor/email/test",
         return res.status(400).json({ error: "Missing required fields" });
       }
 
+      // Resolve [[ contact.X | default: 'Y' ]] tags using an empty contact so
+      // all defaults fire — test emails have no real recipient to personalise against.
+      const testContact = { first_name: 'Test', last_name: 'Subscriber', email: to, city: '', state: '', zip: '', phone: '' };
+      const resolvedHtml = resolveTemplateTags(htmlContent, testContact);
+
       const sesResponse = await ses.send(new SendEmailCommand({
         Source: `${vendorDisplayName} @ HalfCourse <${fromEmail}>`,
         Destination: { ToAddresses: [to] },
         Message: {
           Subject: { Data: subject },
           Body: {
-            Html: { Data: htmlContent },
-            Text: { Data: stripHtmlToText(htmlContent) },
+            Html: { Data: resolvedHtml },
+            Text: { Data: stripHtmlToText(resolvedHtml) },
           },
         },
         ConfigurationSetName: process.env.SES_CONFIG_SET || undefined,
