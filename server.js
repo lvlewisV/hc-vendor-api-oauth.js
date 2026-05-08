@@ -2358,7 +2358,8 @@ app.post(
       preview_text  = '',
       blocks_json   = '[]',
       state_json    = '{}',
-      html_content  = '',
+      email_html    = '',   // frontend sends email_html, not html_content
+      html_content  = email_html,
       draft_id      = null
     } = req.body;
 
@@ -2393,7 +2394,49 @@ app.post(
         return res.json({ success: true, id: parseInt(draft_id), updated: true });
       }
 
-      // ── Insert new draft ─────────────────────────────────────
+      // ── No draft_id: check for an existing draft with the same name first ──
+      // This is a belt-and-suspenders guard for page-refresh scenarios where
+      // _hcebCurrentDraftId is lost on the client but the draft row still exists.
+      const existing = await pool.request()
+        .input('vendor_handle', sql.NVarChar,      handle)
+        .input('name',          sql.NVarChar(200), campaign_name)
+        .query(`
+          SELECT TOP 1 id FROM scheduled_campaigns
+          WHERE vendor_handle = @vendor_handle
+            AND campaign_name = @name
+            AND status = 'draft'
+          ORDER BY created_at DESC
+        `);
+
+      if (existing.recordset.length) {
+        // Update the matched draft so we don't create a duplicate
+        const existingId = existing.recordset[0].id;
+        await pool.request()
+          .input('id',            sql.Int,                existingId)
+          .input('vendor_handle', sql.NVarChar,           handle)
+          .input('name',          sql.NVarChar(200),      campaign_name)
+          .input('subject',       sql.NVarChar(500),      subject)
+          .input('preview_text',  sql.NVarChar(500),      preview_text)
+          .input('blocks_json',   sql.NVarChar(sql.MAX),  blocks_json)
+          .input('state_json',    sql.NVarChar(sql.MAX),  state_json)
+          .input('html_content',  sql.NVarChar(sql.MAX),  html_content)
+          .query(`
+            UPDATE scheduled_campaigns
+            SET campaign_name = @name,
+                subject       = @subject,
+                preview_text  = @preview_text,
+                blocks_json   = @blocks_json,
+                state_json    = @state_json,
+                html_content  = @html_content,
+                updated_at    = GETDATE()
+            WHERE id = @id
+              AND vendor_handle = @vendor_handle
+              AND status = 'draft'
+          `);
+        return res.json({ success: true, id: existingId, updated: true });
+      }
+
+      // ── No existing draft with this name — insert a new one ──────────────
       const result = await pool.request()
         .input('vendor_handle', sql.NVarChar,           handle)
         .input('name',          sql.NVarChar(200),      campaign_name)
